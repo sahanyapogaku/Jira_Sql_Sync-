@@ -32,13 +32,13 @@ rather review it first.
 ## Usage
 
 ```
-# Incremental sync — issues updated in the last 1 day (default)
+# Incremental sync: issues updated in the last 1 day (default)
 python main.py --incremental
 
 # Incremental sync with a wider window
 python main.py --incremental --days 7
 
-# Full sync — every issue in every project, no date filter
+# Full sync : every issue in every project, no date filter
 python main.py --full
 ```
 
@@ -60,30 +60,30 @@ is included; new projects are picked up automatically on the next run.
 Three tables, linked by `issue_key` (also carrying `issue_id`, Jira's
 immutable internal ID, as primary key on `jira_issues`):
 
-- **`jira_issues`** — one row per issue, current state. Standard fields are
+- **`jira_issues`** : one row per issue, current state. Standard fields are
   flattened into columns; every `customfield_*` key is preserved as-is (no
   name resolution) in `custom_fields_json`, since custom fields vary heavily
   by project/issue type. `raw_json` keeps the full original payload as a
   safety net. Upserted via `MERGE` keyed on `issue_id`.
-- **`jira_issue_changelog`** — one row per field-change event, sourced from
+- **`jira_issue_changelog`** : one row per field-change event, sourced from
   `/issue/{key}/changelog`. This is what lets you reconstruct status history
   (or any field's history) over time. Idempotent insert keyed on
   `(issue_id, changelog_id, field_name)`.
-- **`jira_worklogs`** — one row per worklog entry, sourced from
+- **`jira_worklogs`** : one row per worklog entry, sourced from
   `/issue/{key}/worklog`. Idempotent insert keyed on `(issue_id, worklog_id)`.
 
 Full DDL: see `schema.sql`.
 
 ## Files
 
-- `jira_client.py` — Jira REST API calls: project discovery, issue search
+- `jira_client.py` : Jira REST API calls: project discovery, issue search
   (`/search/jql` with `nextPageToken` pagination), changelog, worklogs.
   Retries with exponential backoff on 429s and transient network/5xx errors;
   raises immediately on 401/403.
-- `transform.py` — raw Jira JSON -> row dicts for all three tables.
-- `db.py` — MSSQL connection, schema bootstrap, batched MERGE/insert logic.
-- `main.py` — CLI entrypoint (`--full` / `--incremental --days N`), logging.
-- `schema.sql` — CREATE TABLE DDL (idempotent, guarded by `IF OBJECT_ID(...) IS NULL`).
+- `transform.py` : raw Jira JSON -> row dicts for all three tables.
+- `db.py` :MSSQL connection, schema bootstrap, batched MERGE/insert logic.
+- `main.py` : CLI entrypoint (`--full` / `--incremental --days N`), logging.
+- `schema.sql` : CREATE TABLE DDL (idempotent, guarded by `IF OBJECT_ID(...) IS NULL`).
 
 ## Error handling
 
