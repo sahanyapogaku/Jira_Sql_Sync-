@@ -1,8 +1,10 @@
 # Jira Cloud -> MSSQL ETL
 
-Extracts issues, changelog (status/field history), and worklogs from Jira Cloud
-across **all** projects the API token can see, and loads them into SQL Server
-for analytics.
+Extracts issues, projects, statuses, changelog (status/field history),
+worklogs, comments, issue links, remote links, labels, custom fields, fix
+versions, attachments, and parent/epic hierarchy from Jira Cloud across
+**all** projects the API token can see, and loads them into SQL Server for
+analytics.
 
 ## Setup
 
@@ -57,33 +59,71 @@ is included; new projects are picked up automatically on the next run.
 
 ## Data model
 
-Three tables, linked by `issue_key` (also carrying `issue_id`, Jira's
-immutable internal ID, as primary key on `jira_issues`):
+Issues are the hub, linked by `issue_key` (also carrying `issue_id`, Jira's
+immutable internal ID, as primary key on `jira_issues`). Dimension/lookup
+tables are upserted via `MERGE`; append-only event logs are idempotent
+inserts keyed on their natural event key; a few "current state" tables are
+wholesale-replaced per issue on every sync since Jira reports only the
+current set, not a diff (see `db.replace_*`).
 
 - **`jira_issues`** : one row per issue, current state. Standard fields are
   flattened into columns; every `customfield_*` key is preserved as-is (no
   name resolution) in `custom_fields_json`, since custom fields vary heavily
   by project/issue type. `raw_json` keeps the full original payload as a
   safety net. Upserted via `MERGE` keyed on `issue_id`.
-- **`jira_issue_changelog`** : one row per field-change event, sourced from
-  `/issue/{key}/changelog`. This is what lets you reconstruct status history
-  (or any field's history) over time. Idempotent insert keyed on
-  `(issue_id, changelog_id, field_name)`.
-- **`jira_worklogs`** : one row per worklog entry, sourced from
+- **`jira_project`** — one row per project (`project_id`, `project_key`,
+  `project_name`, `project_type_key`). `jira_issues.project_id` FKs into it.
+- **`jira_status_categories`** / **`jira_statuses`** — Jira's global status
+  list and the "To Do / In Progress / Done" category each status belongs to,
+  discovered via `/rest/api/3/status`. Statuses since deleted from a workflow
+  (absent from that endpoint but still referenced by old changelog entries)
+  are seeded as placeholder rows with `category_id = NULL`.
+- **`jira_issue_changelog`** — one row per non-status field-change event,
+  sourced from `/issue/{key}/changelog`. Idempotent insert keyed on
+  `(issue_id, changelog_id, item_index)`.
+- **`jira_issue_status_history`** — status-change events split out from the
+  general changelog (Atlassian's recommended 2-table pattern), with
+  `from_status_id`/`to_status_id` as FKs into `jira_statuses` instead of
+  plain text. Idempotent insert keyed on `(issue_id, changelog_id, item_index)`.
+- **`jira_worklogs`** — one row per worklog entry, sourced from
   `/issue/{key}/worklog`. Idempotent insert keyed on `(issue_id, worklog_id)`.
+- **`jira_comments`** — one row per comment, sourced from
+  `/issue/{key}/comment`.
+- **`jira_issue_links`** — one row per issue-link relationship (`fields.issuelinks`:
+  issue-to-issue links only).
+- **`jira_issue_remote_links`** — one row per remote link, sourced from
+  `/issue/{key}/remotelink`: Confluence pages, web URLs, and "relationship" links
+  (e.g. "Approved") that `fields.issuelinks` doesn't cover. Idempotent insert keyed
+  on `(issue_id, remote_link_id)`.
+- **`jira_issue_labels`** — one row per `(issue_id, label)`, parsed out of
+  `fields.labels` so labels are queryable/joinable instead of trapped in
+  `jira_issues.labels`'s JSON blob. Replaced wholesale per issue on each sync.
+- **`jira_custom_field_definitions`** — the field ID -> name/type lookup for
+  every `customfield_*` key (from `/rest/api/3/field`), so `field_id` values
+  elsewhere are resolvable to a human name.
+- **`jira_custom_field_values`** — one row per `(issue_id, field_id)`, current
+  value only. Replaced wholesale per issue on each sync.
+- **`jira_fix_versions`** / **`jira_issue_fix_versions`** — the version
+  dimension and its issue junction table. The junction is replaced wholesale
+  per issue on each sync.
+- **`jira_issue_attachments`** — one row per attachment, sourced from
+  `fields.attachment`. Idempotent insert keyed on `(issue_id, attachment_id)`.
+- **`jira_issue_hierarchy`** — one row per issue with a parent (subtask ->
+  parent task, or story/task -> epic), keyed on `child_issue_id`. Replaced
+  wholesale per issue on each sync since an issue has at most one parent.
 
 Full DDL: see `schema.sql`.
 
 ## Files
 
-- `jira_client.py` : Jira REST API calls: project discovery, issue search
-  (`/search/jql` with `nextPageToken` pagination), changelog, worklogs.
-  Retries with exponential backoff on 429s and transient network/5xx errors;
-  raises immediately on 401/403.
-- `transform.py` : raw Jira JSON -> row dicts for all three tables.
-- `db.py` :MSSQL connection, schema bootstrap, batched MERGE/insert logic.
-- `main.py` : CLI entrypoint (`--full` / `--incremental --days N`), logging.
-- `schema.sql` : CREATE TABLE DDL (idempotent, guarded by `IF OBJECT_ID(...) IS NULL`).
+- `jira_client.py` — Jira REST API calls: project/status/field discovery,
+  issue search (`/search/jql` with `nextPageToken` pagination), changelog,
+  worklogs, comments. Retries with exponential backoff on 429s and transient
+  network/5xx errors; raises immediately on 401/403.
+- `transform.py` — raw Jira JSON -> row dicts for every table.
+- `db.py` — MSSQL connection, schema bootstrap, batched MERGE/insert/replace logic.
+- `main.py` — CLI entrypoint (`--full` / `--incremental --days N`), logging.
+- `schema.sql` — CREATE TABLE DDL (idempotent, guarded by `IF OBJECT_ID(...) IS NULL`).
 
 ## Error handling
 

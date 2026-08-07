@@ -39,28 +39,60 @@ def build_jql(full, days):
     return f'updated >= -{days}d ORDER BY updated ASC'
 
 
-def run(jql, conn, client):
+def run(jql, conn, client, known_status_ids):
     issue_batch = []
+    project_batch = {}
     changelog_batch = []
+    status_history_batch = []
+    ghost_status_batch = []
     worklog_batch = []
     comment_batch = []
     issuelink_batch = []
+    remotelink_batch = []
+    customfieldvalue_batch = []
+    fixversion_batch = {}
+    issue_fixversion_batch = []
+    attachment_batch = []
+    hierarchy_batch = []
+    label_batch = []
+    batch_issue_ids = []
 
     total_issues = 0
     total_changelog = 0
+    total_status_history = 0
     total_worklogs = 0
     total_comments = 0
     total_issuelinks = 0
+    total_remotelinks = 0
+    total_attachments = 0
 
     def flush():
-        nonlocal issue_batch, changelog_batch, worklog_batch, comment_batch, issuelink_batch
-        nonlocal total_changelog, total_worklogs, total_comments, total_issuelinks
+        nonlocal issue_batch, project_batch, changelog_batch, status_history_batch, ghost_status_batch
+        nonlocal worklog_batch, comment_batch, issuelink_batch, remotelink_batch
+        nonlocal customfieldvalue_batch, fixversion_batch, issue_fixversion_batch, attachment_batch, hierarchy_batch
+        nonlocal label_batch, batch_issue_ids
+        nonlocal total_changelog, total_status_history, total_worklogs, total_comments, total_issuelinks
+        nonlocal total_remotelinks, total_attachments
+        if project_batch:
+            # Must upsert before issue_batch: jira_issues.project_id has an FK to jira_project.
+            db.upsert_projects(conn, list(project_batch.values()))
+            project_batch = {}
         if issue_batch:
             db.upsert_issues(conn, issue_batch)
             issue_batch = []
         if changelog_batch:
             total_changelog += db.insert_changelog(conn, changelog_batch)
             changelog_batch = []
+        if ghost_status_batch:
+            # Statuses that have since been deleted from the workflow: gone from Jira's
+            # live /status list (and even a direct by-id lookup 404s), but changelog
+            # history still references them by id. Must upsert before status_history_batch:
+            # from/to_status_id are FKs into jira_statuses.
+            db.upsert_statuses(conn, ghost_status_batch)
+            ghost_status_batch = []
+        if status_history_batch:
+            total_status_history += db.insert_status_history(conn, status_history_batch)
+            status_history_batch = []
         if worklog_batch:
             total_worklogs += db.insert_worklogs(conn, worklog_batch)
             worklog_batch = []
@@ -70,20 +102,74 @@ def run(jql, conn, client):
         if issuelink_batch:
             total_issuelinks += db.insert_issuelinks(conn, issuelink_batch)
             issuelink_batch = []
+        if remotelink_batch:
+            total_remotelinks += db.insert_remote_links(conn, remotelink_batch)
+            remotelink_batch = []
+        if fixversion_batch:
+            db.upsert_fix_versions(conn, list(fixversion_batch.values()))
+            fixversion_batch = {}
+        if attachment_batch:
+            total_attachments += db.insert_attachments(conn, attachment_batch)
+            attachment_batch = []
+        if batch_issue_ids:
+            db.replace_custom_field_values(conn, batch_issue_ids, customfieldvalue_batch)
+            db.replace_issue_fix_versions(conn, batch_issue_ids, issue_fixversion_batch)
+            db.replace_hierarchy(conn, batch_issue_ids, hierarchy_batch)
+            db.replace_labels(conn, batch_issue_ids, label_batch)
+            customfieldvalue_batch = []
+            issue_fixversion_batch = []
+            hierarchy_batch = []
+            label_batch = []
+            batch_issue_ids = []
 
     for issue in client.search_issues(jql, fields="*all"):
         issue_id = int(issue["id"])
         issue_key = issue["key"]
+        fields = issue.get("fields", {})
 
         issue_batch.append(transform.flatten_issue(issue))
-        issuelink_batch.extend(transform.extract_issuelink_rows(issue_id, issue_key, issue.get("fields", {})))
+        batch_issue_ids.append(issue_id)
+
+        project_row = transform.extract_project_row(fields)
+        if project_row:
+            project_batch[project_row["project_id"]] = project_row
+
+        issuelink_batch.extend(transform.extract_issuelink_rows(issue_id, issue_key, fields))
+        customfieldvalue_batch.extend(transform.extract_custom_field_value_rows(issue_id, issue_key, fields))
+        attachment_batch.extend(transform.extract_attachment_rows(issue_id, issue_key, fields))
+        issue_fixversion_batch.extend(transform.extract_issue_fix_version_links(issue_id, issue_key, fields))
+        label_batch.extend(transform.extract_label_rows(issue_id, issue_key, fields))
+        for fv_row in transform.extract_fix_version_rows(fields):
+            fixversion_batch[fv_row["version_id"]] = fv_row
+        hierarchy_row = transform.extract_hierarchy_row(issue_id, issue_key, fields)
+        if hierarchy_row:
+            hierarchy_batch.append(hierarchy_row)
+
         total_issues += 1
 
         try:
             for history_entry in client.get_changelog(issue_key):
                 changelog_batch.extend(transform.extract_changelog_rows(issue_id, issue_key, history_entry))
+                for row in transform.extract_status_history_rows(issue_id, issue_key, history_entry):
+                    for sid, sname in (
+                        (row["from_status_id"], row.pop("from_status_name")),
+                        (row["to_status_id"], row.pop("to_status_name")),
+                    ):
+                        if sid and sid not in known_status_ids:
+                            known_status_ids.add(sid)
+                            ghost_status_batch.append({
+                                "status_id": sid, "status_name": sname, "category_id": None,
+                            })
+                    status_history_batch.append(row)
         except JiraAPIError as exc:
             logger.warning("Skipping changelog for %s after repeated failures: %s", issue_key, exc)
+
+        try:
+            remotelink_batch.extend(
+                transform.extract_remote_link_rows(issue_id, issue_key, client.get_remote_links(issue_key))
+            )
+        except JiraAPIError as exc:
+            logger.warning("Skipping remote links for %s after repeated failures: %s", issue_key, exc)
 
         try:
             for worklog_entry in client.get_worklogs(issue_key):
@@ -103,9 +189,10 @@ def run(jql, conn, client):
 
     flush()
     logger.info(
-        "Run complete: %d issues, %d changelog events, %d worklog entries, "
-        "%d comments, %d issue links loaded",
-        total_issues, total_changelog, total_worklogs, total_comments, total_issuelinks,
+        "Run complete: %d issues, %d changelog events, %d status transitions, %d worklog entries, "
+        "%d comments, %d issue links, %d remote links, %d attachments loaded",
+        total_issues, total_changelog, total_status_history, total_worklogs,
+        total_comments, total_issuelinks, total_remotelinks, total_attachments,
     )
 
 
@@ -146,7 +233,29 @@ def main():
         projects = client.list_projects()
         logger.info("Scope: ALL %d discovered projects (no project filter applied to JQL)", len(projects))
 
-        run(jql, conn, client)
+        field_defs = client.list_fields()
+        db.upsert_field_definitions(conn, [
+            {"field_id": f["id"], "field_name": f["name"], "field_type": f["type"]} for f in field_defs
+        ])
+
+        statuses = client.list_statuses()
+        known_status_ids = {s["status_id"] for s in statuses}
+        categories_by_id = {}
+        for s in statuses:
+            if s["category_id"] is not None:
+                categories_by_id[s["category_id"]] = {
+                    "category_id": s["category_id"],
+                    "category_key": s["category_key"],
+                    "category_name": s["category_name"],
+                    "color_name": s["color_name"],
+                }
+        db.upsert_status_categories(conn, list(categories_by_id.values()))
+        db.upsert_statuses(conn, [
+            {"status_id": s["status_id"], "status_name": s["status_name"], "category_id": s["category_id"]}
+            for s in statuses
+        ])
+
+        run(jql, conn, client, known_status_ids)
 
     except JiraAuthError as exc:
         logger.critical("Jira authentication failed: %s", exc)

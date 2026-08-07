@@ -101,6 +101,32 @@ class JiraClient:
         logger.info("Discovered %d projects: %s", len(projects), ", ".join(p["key"] for p in projects))
         return projects
 
+    def list_statuses(self):
+        """Discover all statuses and their categories visible to this API token."""
+        resp = self._request("GET", "/rest/api/3/status")
+        data = resp.json()
+        statuses = []
+        for s in data:
+            cat = s.get("statusCategory") or {}
+            statuses.append({
+                "status_id": str(s["id"]),
+                "status_name": s.get("name"),
+                "category_id": cat.get("id"),
+                "category_key": cat.get("key"),
+                "category_name": cat.get("name"),
+                "color_name": cat.get("colorName"),
+            })
+        logger.info("Discovered %d statuses", len(statuses))
+        return statuses
+
+    def list_fields(self):
+        """Discover all fields (system + custom) visible to this API token. Returns list of {id, name, type}."""
+        resp = self._request("GET", "/rest/api/3/field")
+        data = resp.json()
+        fields = [{"id": f["id"], "name": f.get("name"), "type": (f.get("schema") or {}).get("type")} for f in data]
+        logger.info("Discovered %d fields (%d custom)", len(fields), sum(1 for f in data if f.get("custom")))
+        return fields
+
     def search_issues(self, jql, fields="*all"):
         """Generator yielding issue dicts, paginated via nextPageToken (Jira Cloud /search/jql)."""
         next_page_token = None
@@ -162,6 +188,14 @@ class JiraClient:
             total = data.get("total", start_at)
             if start_at >= total or not values:
                 break
+
+    def get_remote_links(self, issue_key):
+        """Remote links (Confluence pages, web URLs, relationship links like "Approved") for
+        an issue: {id, globalId, relationship, object: {url, title, ...}}. Not paginated —
+        Jira returns the full list in one response.
+        """
+        resp = self._request("GET", f"/rest/api/3/issue/{issue_key}/remotelink")
+        return resp.json()
 
     def get_worklogs(self, issue_key):
         """Generator yielding worklog entries: {id, author, timeSpentSeconds, started, comment, ...}."""

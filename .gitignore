@@ -1,4 +1,4 @@
 .env
 __pycache__/
 *.pyc
-jira_etl.log
+*.log

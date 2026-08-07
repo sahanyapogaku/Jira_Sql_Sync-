@@ -1,6 +1,18 @@
 -- Jira -> MSSQL analytics schema
 -- Idempotent: safe to run every startup, only creates objects that don't exist yet.
 
+IF OBJECT_ID('dbo.jira_project', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.jira_project (
+        project_id          BIGINT          NOT NULL PRIMARY KEY,
+        project_key         NVARCHAR(20)    NOT NULL,
+        project_name        NVARCHAR(255)   NULL,
+        project_type_key    NVARCHAR(50)    NULL,   -- e.g. "software", "business"
+        etl_loaded_at        DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT UQ_jira_project_key UNIQUE (project_key)
+    );
+END
+
 IF OBJECT_ID('dbo.jira_issues', 'U') IS NULL
 BEGIN
     CREATE TABLE dbo.jira_issues (
@@ -32,6 +44,22 @@ BEGIN
     CREATE INDEX IX_jira_issues_updated ON dbo.jira_issues(updated);
 END
 
+-- Added alongside jira_project below: project_id is additive. project_key/project_name
+-- stay as-is for now (denormalized-convenience-vs-drop tradeoff is a separate open question).
+IF COL_LENGTH('dbo.jira_issues', 'project_id') IS NULL
+BEGIN
+    ALTER TABLE dbo.jira_issues ADD project_id BIGINT NULL;
+END
+
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_jira_issues_project')
+BEGIN
+    ALTER TABLE dbo.jira_issues ADD CONSTRAINT FK_jira_issues_project
+        FOREIGN KEY (project_id) REFERENCES dbo.jira_project(project_id);
+END
+
+-- General field-change history. Status transitions are excluded here and land in
+-- jira_issue_status_history instead -- Atlassian's recommended structure keeps the two
+-- separate, with status referencing a proper jira_statuses lookup instead of plain text.
 IF OBJECT_ID('dbo.jira_issue_changelog', 'U') IS NULL
 BEGIN
     CREATE TABLE dbo.jira_issue_changelog (
@@ -40,7 +68,7 @@ BEGIN
         issue_key               NVARCHAR(20)    NOT NULL,
         changelog_id              NVARCHAR(50)    NOT NULL,   -- Jira history "id"
         item_index                  INT             NOT NULL,   -- position within the history entry's items[]
-        field_name                  NVARCHAR(100)   NOT NULL,   -- e.g. "status"
+        field_name                  NVARCHAR(100)   NOT NULL,   -- e.g. "priority" ("status" excluded, see above)
         field_type                    NVARCHAR(50)    NULL,       -- "jira" | "custom"
         from_value                      NVARCHAR(MAX)   NULL,       -- raw id/value
         from_string                       NVARCHAR(MAX)   NULL,       -- display value
@@ -54,6 +82,53 @@ BEGIN
     );
     CREATE INDEX IX_jira_changelog_issue_key ON dbo.jira_issue_changelog(issue_key);
     CREATE INDEX IX_jira_changelog_field ON dbo.jira_issue_changelog(field_name);
+END
+
+IF OBJECT_ID('dbo.jira_status_categories', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.jira_status_categories (
+        category_id    INT             NOT NULL PRIMARY KEY,
+        category_key   NVARCHAR(50)    NULL,   -- e.g. "new", "indeterminate", "done"
+        category_name  NVARCHAR(100)   NULL,   -- e.g. "To Do", "In Progress", "Done"
+        color_name     NVARCHAR(50)    NULL,
+        etl_loaded_at  DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME()
+    );
+END
+
+IF OBJECT_ID('dbo.jira_statuses', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.jira_statuses (
+        status_id      NVARCHAR(50)    NOT NULL PRIMARY KEY,   -- Jira status "id"
+        status_name    NVARCHAR(100)   NULL,
+        category_id    INT             NULL,
+        etl_loaded_at  DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT FK_jira_statuses_category FOREIGN KEY (category_id)
+            REFERENCES dbo.jira_status_categories(category_id)
+    );
+END
+
+-- Populated from the same /issue/{key}/changelog entries as jira_issue_changelog, but
+-- only the "status" items, with from/to as proper FKs into jira_statuses rather than
+-- plain text -- this is the second table of Atlassian's recommended 2-table history split.
+IF OBJECT_ID('dbo.jira_issue_status_history', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.jira_issue_status_history (
+        row_id              BIGINT IDENTITY(1,1) PRIMARY KEY,
+        issue_id             BIGINT          NOT NULL,
+        issue_key              NVARCHAR(20)    NOT NULL,
+        changelog_id             NVARCHAR(50)    NOT NULL,   -- Jira history "id"
+        item_index                 INT             NOT NULL,   -- position within that history entry's items[]
+        from_status_id                NVARCHAR(50)    NULL,       -- NULL for an issue's first-ever status
+        to_status_id                     NVARCHAR(50)    NOT NULL,
+        author_account_id                   NVARCHAR(100)   NULL,
+        author_name                           NVARCHAR(255)   NULL,
+        changed_at                               DATETIME2       NOT NULL,
+        etl_loaded_at                               DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT UQ_jira_status_history_event UNIQUE (issue_id, changelog_id, item_index),
+        CONSTRAINT FK_status_history_from FOREIGN KEY (from_status_id) REFERENCES dbo.jira_statuses(status_id),
+        CONSTRAINT FK_status_history_to FOREIGN KEY (to_status_id) REFERENCES dbo.jira_statuses(status_id)
+    );
+    CREATE INDEX IX_jira_status_history_issue_key ON dbo.jira_issue_status_history(issue_key);
 END
 
 IF OBJECT_ID('dbo.jira_worklogs', 'U') IS NULL
@@ -110,4 +185,121 @@ BEGIN
         CONSTRAINT UQ_jira_issuelink_entry UNIQUE (issue_id, link_id)
     );
     CREATE INDEX IX_jira_issuelinks_issue_key ON dbo.jira_issue_links(issue_key);
+END
+
+IF OBJECT_ID('dbo.jira_custom_field_definitions', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.jira_custom_field_definitions (
+        field_id      NVARCHAR(50)    NOT NULL PRIMARY KEY,   -- e.g. "customfield_10057"
+        field_name    NVARCHAR(255)   NULL,
+        field_type    NVARCHAR(100)   NULL,                   -- schema.type, e.g. "string", "option", "array"
+        etl_loaded_at DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME()
+    );
+END
+
+IF OBJECT_ID('dbo.jira_custom_field_values', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.jira_custom_field_values (
+        issue_id      BIGINT          NOT NULL,
+        issue_key     NVARCHAR(20)    NOT NULL,
+        field_id      NVARCHAR(50)    NOT NULL,   -- e.g. "customfield_10057"
+        value         NVARCHAR(MAX)   NULL,       -- JSON-serialized value (matches custom_fields_json's encoding)
+        etl_loaded_at DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_jira_custom_field_values PRIMARY KEY (issue_id, field_id)
+    );
+    CREATE INDEX IX_jira_custom_field_values_field ON dbo.jira_custom_field_values(field_id);
+END
+
+IF OBJECT_ID('dbo.jira_fix_versions', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.jira_fix_versions (
+        version_id     BIGINT          NOT NULL PRIMARY KEY,
+        version_name   NVARCHAR(255)   NULL,
+        project_id     BIGINT          NULL,
+        release_date   DATE            NULL,
+        released       BIT             NULL,
+        etl_loaded_at  DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME()
+    );
+END
+
+IF OBJECT_ID('dbo.jira_issue_fix_versions', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.jira_issue_fix_versions (
+        issue_id      BIGINT          NOT NULL,
+        issue_key     NVARCHAR(20)    NOT NULL,
+        version_id    BIGINT          NOT NULL,
+        etl_loaded_at DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_jira_issue_fix_versions PRIMARY KEY (issue_id, version_id)
+    );
+END
+
+IF OBJECT_ID('dbo.jira_issue_attachments', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.jira_issue_attachments (
+        row_id              BIGINT IDENTITY(1,1) PRIMARY KEY,
+        attachment_id        NVARCHAR(50)    NOT NULL,   -- Jira attachment "id"
+        issue_id               BIGINT          NOT NULL,
+        issue_key                NVARCHAR(20)    NOT NULL,
+        filename                   NVARCHAR(500)   NULL,
+        size_bytes                   BIGINT          NULL,
+        mime_type                      NVARCHAR(100)   NULL,
+        author_account_id                NVARCHAR(100)   NULL,
+        author_name                        NVARCHAR(255)   NULL,
+        attachment_created                   DATETIME2       NULL,
+        content_url                            NVARCHAR(1000)  NULL,
+        etl_loaded_at                            DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT UQ_jira_attachment_entry UNIQUE (issue_id, attachment_id)
+    );
+    CREATE INDEX IX_jira_attachments_issue_key ON dbo.jira_issue_attachments(issue_key);
+END
+
+-- Parsed out of jira_issues.labels (which stays as-is, a JSON array, for the raw-payload
+-- convenience) so labels are actually queryable/joinable rather than trapped in a blob.
+-- Current-state, not an event log: replaced wholesale per issue on each sync, same as
+-- custom field values / fix versions, since Jira reports only the current label set.
+IF OBJECT_ID('dbo.jira_issue_labels', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.jira_issue_labels (
+        issue_id      BIGINT          NOT NULL,
+        issue_key     NVARCHAR(20)    NOT NULL,
+        label         NVARCHAR(255)   NOT NULL,
+        etl_loaded_at DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_jira_issue_labels PRIMARY KEY (issue_id, label)
+    );
+    CREATE INDEX IX_jira_issue_labels_label ON dbo.jira_issue_labels(label);
+END
+
+-- Remote links (Confluence pages, web URLs, "Approved"-style relationship links) are a
+-- separate Jira concept from fields.issuelinks (issue-to-issue only) and come from a
+-- separate endpoint: /issue/{key}/remotelink. jira_issue_links above never captured these.
+IF OBJECT_ID('dbo.jira_issue_remote_links', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.jira_issue_remote_links (
+        row_id                BIGINT IDENTITY(1,1) PRIMARY KEY,
+        issue_id               BIGINT          NOT NULL,
+        issue_key                NVARCHAR(20)    NOT NULL,
+        remote_link_id              NVARCHAR(50)    NOT NULL,   -- Jira remotelink "id"
+        relationship                  NVARCHAR(255)   NULL,       -- e.g. "Approved", "mentioned in"
+        title                           NVARCHAR(500)   NULL,       -- object.title
+        url                               NVARCHAR(1000)  NULL,       -- object.url
+        global_id                           NVARCHAR(255)   NULL,
+        etl_loaded_at                          DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT UQ_jira_remote_link_entry UNIQUE (issue_id, remote_link_id)
+    );
+    CREATE INDEX IX_jira_remote_links_issue_key ON dbo.jira_issue_remote_links(issue_key);
+END
+
+-- child_issue_id is the PK (not an IDENTITY row_id like the append-only tables above):
+-- an issue has at most one parent at a time, so this is a current-state row per child,
+-- replaced wholesale on each sync rather than appended to. See db.replace_hierarchy().
+IF OBJECT_ID('dbo.jira_issue_hierarchy', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.jira_issue_hierarchy (
+        child_issue_id     BIGINT          NOT NULL PRIMARY KEY,
+        child_issue_key    NVARCHAR(20)    NOT NULL,
+        parent_issue_id    BIGINT          NOT NULL,
+        parent_issue_key   NVARCHAR(20)    NOT NULL,
+        relationship_type  NVARCHAR(20)    NOT NULL,   -- 'subtask' | 'epic_child'
+        etl_loaded_at      DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME()
+    );
 END

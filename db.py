@@ -39,6 +39,19 @@ def _coerce_datetimes(rows, columns):
                 row[col] = _parse_dt(row[col])
 
 
+def _parse_date(value):
+    if not value:
+        return None
+    return dateparser.isoparse(value).date()
+
+
+def _coerce_dates(rows, columns):
+    for row in rows:
+        for col in columns:
+            if col in row:
+                row[col] = _parse_date(row[col])
+
+
 def build_connection_string():
     server = os.environ["MSSQL_SERVER"]
     database = os.environ["MSSQL_DATABASE"]
@@ -67,11 +80,43 @@ def apply_schema(conn):
 
 
 ISSUE_COLUMNS = [
-    "issue_id", "issue_key", "project_key", "project_name", "issue_type", "summary",
+    "issue_id", "issue_key", "project_id", "project_key", "project_name", "issue_type", "summary",
     "status", "status_category", "priority", "assignee_account_id", "assignee_name",
     "reporter_account_id", "reporter_name", "created", "updated", "resolutiondate",
     "labels", "components", "fix_versions", "custom_fields_json", "raw_json",
 ]
+
+PROJECT_COLUMNS = ["project_id", "project_key", "project_name", "project_type_key"]
+
+FIELD_DEF_COLUMNS = ["field_id", "field_name", "field_type"]
+
+CUSTOM_FIELD_VALUE_COLUMNS = ["issue_id", "issue_key", "field_id", "value"]
+
+FIX_VERSION_COLUMNS = ["version_id", "version_name", "project_id", "release_date", "released"]
+
+ISSUE_FIX_VERSION_COLUMNS = ["issue_id", "issue_key", "version_id"]
+
+ATTACHMENT_COLUMNS = [
+    "attachment_id", "issue_id", "issue_key", "filename", "size_bytes", "mime_type",
+    "author_account_id", "author_name", "attachment_created", "content_url",
+]
+
+ATTACHMENT_DATETIME_COLS = ("attachment_created",)
+
+HIERARCHY_COLUMNS = [
+    "child_issue_id", "child_issue_key", "parent_issue_id", "parent_issue_key", "relationship_type",
+]
+
+STATUS_CATEGORY_COLUMNS = ["category_id", "category_key", "category_name", "color_name"]
+
+STATUS_COLUMNS = ["status_id", "status_name", "category_id"]
+
+STATUS_HISTORY_COLUMNS = [
+    "issue_id", "issue_key", "changelog_id", "item_index",
+    "from_status_id", "to_status_id", "author_account_id", "author_name", "changed_at",
+]
+
+STATUS_HISTORY_DATETIME_COLS = ("changed_at",)
 
 CHANGELOG_COLUMNS = [
     "issue_id", "issue_key", "changelog_id", "item_index", "field_name", "field_type",
@@ -93,6 +138,12 @@ COMMENT_COLUMNS = [
 ISSUELINK_COLUMNS = [
     "issue_id", "issue_key", "link_id", "link_type", "direction",
     "linked_issue_id", "linked_issue_key",
+]
+
+LABEL_COLUMNS = ["issue_id", "issue_key", "label"]
+
+REMOTE_LINK_COLUMNS = [
+    "issue_id", "issue_key", "remote_link_id", "relationship", "title", "url", "global_id",
 ]
 
 
@@ -254,3 +305,375 @@ def insert_issuelinks(conn, rows):
     conn.commit()
     logger.info("Inserted %d new issue link rows (%d in batch, rest already present)", inserted, len(rows))
     return inserted
+
+
+def insert_remote_links(conn, rows):
+    if not rows:
+        return 0
+
+    cur = conn.cursor()
+    cur.execute("""
+        IF OBJECT_ID('tempdb..#stg_remote_links') IS NOT NULL DROP TABLE #stg_remote_links;
+        SELECT TOP 0 * INTO #stg_remote_links FROM dbo.jira_issue_remote_links;
+        ALTER TABLE #stg_remote_links ALTER COLUMN etl_loaded_at DATETIME2 NULL;
+    """)
+    placeholders = ", ".join("?" for _ in REMOTE_LINK_COLUMNS)
+    insert_sql = f"INSERT INTO #stg_remote_links ({', '.join(REMOTE_LINK_COLUMNS)}) VALUES ({placeholders})"
+    cur.executemany(insert_sql, _rows_to_tuples(rows, REMOTE_LINK_COLUMNS))
+
+    cols = ", ".join(REMOTE_LINK_COLUMNS)
+    cur.execute(f"""
+        INSERT INTO dbo.jira_issue_remote_links ({cols})
+        SELECT {cols} FROM #stg_remote_links s
+        WHERE NOT EXISTS (
+            SELECT 1 FROM dbo.jira_issue_remote_links t
+            WHERE t.issue_id = s.issue_id
+              AND t.remote_link_id = s.remote_link_id
+        );
+    """)
+    inserted = cur.rowcount
+    conn.commit()
+    logger.info("Inserted %d new remote link rows (%d in batch, rest already present)", inserted, len(rows))
+    return inserted
+
+
+def upsert_status_categories(conn, rows):
+    if not rows:
+        return 0
+
+    cur = conn.cursor()
+    cur.execute("""
+        IF OBJECT_ID('tempdb..#stg_status_categories') IS NOT NULL DROP TABLE #stg_status_categories;
+        SELECT TOP 0 * INTO #stg_status_categories FROM dbo.jira_status_categories;
+        ALTER TABLE #stg_status_categories ALTER COLUMN etl_loaded_at DATETIME2 NULL;
+    """)
+    placeholders = ", ".join("?" for _ in STATUS_CATEGORY_COLUMNS)
+    insert_sql = f"INSERT INTO #stg_status_categories ({', '.join(STATUS_CATEGORY_COLUMNS)}) VALUES ({placeholders})"
+    cur.executemany(insert_sql, _rows_to_tuples(rows, STATUS_CATEGORY_COLUMNS))
+
+    set_clause = ", ".join(f"t.{c} = s.{c}" for c in STATUS_CATEGORY_COLUMNS if c != "category_id")
+    insert_cols = ", ".join(STATUS_CATEGORY_COLUMNS)
+    insert_vals = ", ".join(f"s.{c}" for c in STATUS_CATEGORY_COLUMNS)
+    cur.execute(f"""
+        MERGE dbo.jira_status_categories AS t
+        USING #stg_status_categories AS s
+        ON t.category_id = s.category_id
+        WHEN MATCHED THEN
+            UPDATE SET {set_clause}, t.etl_loaded_at = SYSUTCDATETIME()
+        WHEN NOT MATCHED THEN
+            INSERT ({insert_cols}) VALUES ({insert_vals});
+    """)
+    conn.commit()
+    logger.info("Upserted %d status category rows", len(rows))
+    return len(rows)
+
+
+def upsert_statuses(conn, rows):
+    if not rows:
+        return 0
+
+    cur = conn.cursor()
+    cur.execute("""
+        IF OBJECT_ID('tempdb..#stg_statuses') IS NOT NULL DROP TABLE #stg_statuses;
+        SELECT TOP 0 * INTO #stg_statuses FROM dbo.jira_statuses;
+        ALTER TABLE #stg_statuses ALTER COLUMN etl_loaded_at DATETIME2 NULL;
+    """)
+    placeholders = ", ".join("?" for _ in STATUS_COLUMNS)
+    insert_sql = f"INSERT INTO #stg_statuses ({', '.join(STATUS_COLUMNS)}) VALUES ({placeholders})"
+    cur.executemany(insert_sql, _rows_to_tuples(rows, STATUS_COLUMNS))
+
+    set_clause = ", ".join(f"t.{c} = s.{c}" for c in STATUS_COLUMNS if c != "status_id")
+    insert_cols = ", ".join(STATUS_COLUMNS)
+    insert_vals = ", ".join(f"s.{c}" for c in STATUS_COLUMNS)
+    cur.execute(f"""
+        MERGE dbo.jira_statuses AS t
+        USING #stg_statuses AS s
+        ON t.status_id = s.status_id
+        WHEN MATCHED THEN
+            UPDATE SET {set_clause}, t.etl_loaded_at = SYSUTCDATETIME()
+        WHEN NOT MATCHED THEN
+            INSERT ({insert_cols}) VALUES ({insert_vals});
+    """)
+    conn.commit()
+    logger.info("Upserted %d status rows", len(rows))
+    return len(rows)
+
+
+def insert_status_history(conn, rows):
+    if not rows:
+        return 0
+    _coerce_datetimes(rows, STATUS_HISTORY_DATETIME_COLS)
+
+    cur = conn.cursor()
+    cur.execute("""
+        IF OBJECT_ID('tempdb..#stg_status_history') IS NOT NULL DROP TABLE #stg_status_history;
+        SELECT TOP 0 * INTO #stg_status_history FROM dbo.jira_issue_status_history;
+        ALTER TABLE #stg_status_history ALTER COLUMN etl_loaded_at DATETIME2 NULL;
+    """)
+    placeholders = ", ".join("?" for _ in STATUS_HISTORY_COLUMNS)
+    insert_sql = f"INSERT INTO #stg_status_history ({', '.join(STATUS_HISTORY_COLUMNS)}) VALUES ({placeholders})"
+    cur.executemany(insert_sql, _rows_to_tuples(rows, STATUS_HISTORY_COLUMNS))
+
+    cols = ", ".join(STATUS_HISTORY_COLUMNS)
+    cur.execute(f"""
+        INSERT INTO dbo.jira_issue_status_history ({cols})
+        SELECT {cols} FROM #stg_status_history s
+        WHERE NOT EXISTS (
+            SELECT 1 FROM dbo.jira_issue_status_history t
+            WHERE t.issue_id = s.issue_id
+              AND t.changelog_id = s.changelog_id
+              AND t.item_index = s.item_index
+        );
+    """)
+    inserted = cur.rowcount
+    conn.commit()
+    logger.info("Inserted %d new status history rows (%d in batch, rest already present)", inserted, len(rows))
+    return inserted
+
+
+def upsert_projects(conn, rows):
+    if not rows:
+        return 0
+
+    cur = conn.cursor()
+    cur.execute("""
+        IF OBJECT_ID('tempdb..#stg_projects') IS NOT NULL DROP TABLE #stg_projects;
+        SELECT TOP 0 * INTO #stg_projects FROM dbo.jira_project;
+        ALTER TABLE #stg_projects ALTER COLUMN etl_loaded_at DATETIME2 NULL;
+    """)
+    placeholders = ", ".join("?" for _ in PROJECT_COLUMNS)
+    insert_sql = f"INSERT INTO #stg_projects ({', '.join(PROJECT_COLUMNS)}) VALUES ({placeholders})"
+    cur.executemany(insert_sql, _rows_to_tuples(rows, PROJECT_COLUMNS))
+
+    set_clause = ", ".join(f"t.{c} = s.{c}" for c in PROJECT_COLUMNS if c != "project_id")
+    insert_cols = ", ".join(PROJECT_COLUMNS)
+    insert_vals = ", ".join(f"s.{c}" for c in PROJECT_COLUMNS)
+    cur.execute(f"""
+        MERGE dbo.jira_project AS t
+        USING #stg_projects AS s
+        ON t.project_id = s.project_id
+        WHEN MATCHED THEN
+            UPDATE SET {set_clause}, t.etl_loaded_at = SYSUTCDATETIME()
+        WHEN NOT MATCHED THEN
+            INSERT ({insert_cols}) VALUES ({insert_vals});
+    """)
+    conn.commit()
+    logger.info("Upserted %d project rows", len(rows))
+    return len(rows)
+
+
+def upsert_field_definitions(conn, rows):
+    if not rows:
+        return 0
+
+    cur = conn.cursor()
+    cur.execute("""
+        IF OBJECT_ID('tempdb..#stg_field_defs') IS NOT NULL DROP TABLE #stg_field_defs;
+        SELECT TOP 0 * INTO #stg_field_defs FROM dbo.jira_custom_field_definitions;
+        ALTER TABLE #stg_field_defs ALTER COLUMN etl_loaded_at DATETIME2 NULL;
+    """)
+    placeholders = ", ".join("?" for _ in FIELD_DEF_COLUMNS)
+    insert_sql = f"INSERT INTO #stg_field_defs ({', '.join(FIELD_DEF_COLUMNS)}) VALUES ({placeholders})"
+    cur.executemany(insert_sql, _rows_to_tuples(rows, FIELD_DEF_COLUMNS))
+
+    set_clause = ", ".join(f"t.{c} = s.{c}" for c in FIELD_DEF_COLUMNS if c != "field_id")
+    insert_cols = ", ".join(FIELD_DEF_COLUMNS)
+    insert_vals = ", ".join(f"s.{c}" for c in FIELD_DEF_COLUMNS)
+    cur.execute(f"""
+        MERGE dbo.jira_custom_field_definitions AS t
+        USING #stg_field_defs AS s
+        ON t.field_id = s.field_id
+        WHEN MATCHED THEN
+            UPDATE SET {set_clause}, t.etl_loaded_at = SYSUTCDATETIME()
+        WHEN NOT MATCHED THEN
+            INSERT ({insert_cols}) VALUES ({insert_vals});
+    """)
+    conn.commit()
+    logger.info("Upserted %d custom field definition rows", len(rows))
+    return len(rows)
+
+
+def upsert_fix_versions(conn, rows):
+    if not rows:
+        return 0
+    _coerce_dates(rows, ("release_date",))
+
+    cur = conn.cursor()
+    cur.execute("""
+        IF OBJECT_ID('tempdb..#stg_fix_versions') IS NOT NULL DROP TABLE #stg_fix_versions;
+        SELECT TOP 0 * INTO #stg_fix_versions FROM dbo.jira_fix_versions;
+        ALTER TABLE #stg_fix_versions ALTER COLUMN etl_loaded_at DATETIME2 NULL;
+    """)
+    placeholders = ", ".join("?" for _ in FIX_VERSION_COLUMNS)
+    insert_sql = f"INSERT INTO #stg_fix_versions ({', '.join(FIX_VERSION_COLUMNS)}) VALUES ({placeholders})"
+    cur.executemany(insert_sql, _rows_to_tuples(rows, FIX_VERSION_COLUMNS))
+
+    set_clause = ", ".join(f"t.{c} = s.{c}" for c in FIX_VERSION_COLUMNS if c != "version_id")
+    insert_cols = ", ".join(FIX_VERSION_COLUMNS)
+    insert_vals = ", ".join(f"s.{c}" for c in FIX_VERSION_COLUMNS)
+    cur.execute(f"""
+        MERGE dbo.jira_fix_versions AS t
+        USING #stg_fix_versions AS s
+        ON t.version_id = s.version_id
+        WHEN MATCHED THEN
+            UPDATE SET {set_clause}, t.etl_loaded_at = SYSUTCDATETIME()
+        WHEN NOT MATCHED THEN
+            INSERT ({insert_cols}) VALUES ({insert_vals});
+    """)
+    conn.commit()
+    logger.info("Upserted %d fix version rows", len(rows))
+    return len(rows)
+
+
+def insert_attachments(conn, rows):
+    if not rows:
+        return 0
+    _coerce_datetimes(rows, ATTACHMENT_DATETIME_COLS)
+
+    cur = conn.cursor()
+    cur.execute("""
+        IF OBJECT_ID('tempdb..#stg_attachments') IS NOT NULL DROP TABLE #stg_attachments;
+        SELECT TOP 0 * INTO #stg_attachments FROM dbo.jira_issue_attachments;
+        ALTER TABLE #stg_attachments ALTER COLUMN etl_loaded_at DATETIME2 NULL;
+    """)
+    placeholders = ", ".join("?" for _ in ATTACHMENT_COLUMNS)
+    insert_sql = f"INSERT INTO #stg_attachments ({', '.join(ATTACHMENT_COLUMNS)}) VALUES ({placeholders})"
+    cur.executemany(insert_sql, _rows_to_tuples(rows, ATTACHMENT_COLUMNS))
+
+    cols = ", ".join(ATTACHMENT_COLUMNS)
+    cur.execute(f"""
+        INSERT INTO dbo.jira_issue_attachments ({cols})
+        SELECT {cols} FROM #stg_attachments s
+        WHERE NOT EXISTS (
+            SELECT 1 FROM dbo.jira_issue_attachments t
+            WHERE t.issue_id = s.issue_id
+              AND t.attachment_id = s.attachment_id
+        );
+    """)
+    inserted = cur.rowcount
+    conn.commit()
+    logger.info("Inserted %d new attachment rows (%d in batch, rest already present)", inserted, len(rows))
+    return inserted
+
+
+def replace_custom_field_values(conn, issue_ids, rows):
+    """Replace custom-field values for the given issue_ids with the freshly extracted set.
+
+    Deviates from the append-only insert-where-not-exists pattern used for changelog /
+    worklogs / comments / issuelinks above: a custom field's value is current-state data
+    (it can change or be cleared on re-sync), not an immutable historical event, so stale
+    rows for a re-synced issue must be removed here, not just added to.
+    """
+    if not issue_ids:
+        return 0
+    cur = conn.cursor()
+    placeholders = ", ".join("?" for _ in issue_ids)
+    cur.execute(f"DELETE FROM dbo.jira_custom_field_values WHERE issue_id IN ({placeholders})", issue_ids)
+
+    if rows:
+        cur.execute("""
+            IF OBJECT_ID('tempdb..#stg_cfv') IS NOT NULL DROP TABLE #stg_cfv;
+            SELECT TOP 0 * INTO #stg_cfv FROM dbo.jira_custom_field_values;
+            ALTER TABLE #stg_cfv ALTER COLUMN etl_loaded_at DATETIME2 NULL;
+        """)
+        ph = ", ".join("?" for _ in CUSTOM_FIELD_VALUE_COLUMNS)
+        cur.executemany(
+            f"INSERT INTO #stg_cfv ({', '.join(CUSTOM_FIELD_VALUE_COLUMNS)}) VALUES ({ph})",
+            _rows_to_tuples(rows, CUSTOM_FIELD_VALUE_COLUMNS),
+        )
+        cols = ", ".join(CUSTOM_FIELD_VALUE_COLUMNS)
+        cur.execute(f"INSERT INTO dbo.jira_custom_field_values ({cols}) SELECT {cols} FROM #stg_cfv")
+
+    conn.commit()
+    logger.info("Replaced custom field values for %d issues (%d values loaded)", len(issue_ids), len(rows))
+    return len(rows)
+
+
+def replace_labels(conn, issue_ids, rows):
+    """Replace labels for the given issue_ids with the freshly extracted set. Same
+    rationale as replace_custom_field_values: labels are current-state, not an
+    immutable historical event, so stale rows for a re-synced issue must be cleared.
+    """
+    if not issue_ids:
+        return 0
+    cur = conn.cursor()
+    placeholders = ", ".join("?" for _ in issue_ids)
+    cur.execute(f"DELETE FROM dbo.jira_issue_labels WHERE issue_id IN ({placeholders})", issue_ids)
+
+    if rows:
+        cur.execute("""
+            IF OBJECT_ID('tempdb..#stg_labels') IS NOT NULL DROP TABLE #stg_labels;
+            SELECT TOP 0 * INTO #stg_labels FROM dbo.jira_issue_labels;
+            ALTER TABLE #stg_labels ALTER COLUMN etl_loaded_at DATETIME2 NULL;
+        """)
+        ph = ", ".join("?" for _ in LABEL_COLUMNS)
+        cur.executemany(
+            f"INSERT INTO #stg_labels ({', '.join(LABEL_COLUMNS)}) VALUES ({ph})",
+            _rows_to_tuples(rows, LABEL_COLUMNS),
+        )
+        cols = ", ".join(LABEL_COLUMNS)
+        cur.execute(f"INSERT INTO dbo.jira_issue_labels ({cols}) SELECT {cols} FROM #stg_labels")
+
+    conn.commit()
+    logger.info("Replaced labels for %d issues (%d labels loaded)", len(issue_ids), len(rows))
+    return len(rows)
+
+
+def replace_issue_fix_versions(conn, issue_ids, rows):
+    """Replace fix-version links for the given issue_ids. Same rationale as
+    replace_custom_field_values: fix versions can be added or removed from an issue on
+    re-sync, so this clears stale links rather than only appending new ones.
+    """
+    if not issue_ids:
+        return 0
+    cur = conn.cursor()
+    placeholders = ", ".join("?" for _ in issue_ids)
+    cur.execute(f"DELETE FROM dbo.jira_issue_fix_versions WHERE issue_id IN ({placeholders})", issue_ids)
+
+    if rows:
+        cur.execute("""
+            IF OBJECT_ID('tempdb..#stg_ifv') IS NOT NULL DROP TABLE #stg_ifv;
+            SELECT TOP 0 * INTO #stg_ifv FROM dbo.jira_issue_fix_versions;
+            ALTER TABLE #stg_ifv ALTER COLUMN etl_loaded_at DATETIME2 NULL;
+        """)
+        ph = ", ".join("?" for _ in ISSUE_FIX_VERSION_COLUMNS)
+        cur.executemany(
+            f"INSERT INTO #stg_ifv ({', '.join(ISSUE_FIX_VERSION_COLUMNS)}) VALUES ({ph})",
+            _rows_to_tuples(rows, ISSUE_FIX_VERSION_COLUMNS),
+        )
+        cols = ", ".join(ISSUE_FIX_VERSION_COLUMNS)
+        cur.execute(f"INSERT INTO dbo.jira_issue_fix_versions ({cols}) SELECT {cols} FROM #stg_ifv")
+
+    conn.commit()
+    logger.info("Replaced fix-version links for %d issues (%d links loaded)", len(issue_ids), len(rows))
+    return len(rows)
+
+
+def replace_hierarchy(conn, issue_ids, rows):
+    """Replace parent/child hierarchy rows for the given issue_ids (as children). Same
+    rationale: an issue's parent can change or be removed on re-sync, so stale rows must
+    be cleared rather than only appended to.
+    """
+    if not issue_ids:
+        return 0
+    cur = conn.cursor()
+    placeholders = ", ".join("?" for _ in issue_ids)
+    cur.execute(f"DELETE FROM dbo.jira_issue_hierarchy WHERE child_issue_id IN ({placeholders})", issue_ids)
+
+    if rows:
+        cur.execute("""
+            IF OBJECT_ID('tempdb..#stg_hierarchy') IS NOT NULL DROP TABLE #stg_hierarchy;
+            SELECT TOP 0 * INTO #stg_hierarchy FROM dbo.jira_issue_hierarchy;
+            ALTER TABLE #stg_hierarchy ALTER COLUMN etl_loaded_at DATETIME2 NULL;
+        """)
+        ph = ", ".join("?" for _ in HIERARCHY_COLUMNS)
+        cur.executemany(
+            f"INSERT INTO #stg_hierarchy ({', '.join(HIERARCHY_COLUMNS)}) VALUES ({ph})",
+            _rows_to_tuples(rows, HIERARCHY_COLUMNS),
+        )
+        cols = ", ".join(HIERARCHY_COLUMNS)
+        cur.execute(f"INSERT INTO dbo.jira_issue_hierarchy ({cols}) SELECT {cols} FROM #stg_hierarchy")
+
+    conn.commit()
+    logger.info("Replaced hierarchy rows for %d issues (%d parent links loaded)", len(issue_ids), len(rows))
+    return len(rows)
