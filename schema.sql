@@ -303,3 +303,74 @@ BEGIN
         etl_loaded_at      DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME()
     );
 END
+
+-- Components carry a stable id and are reusable per project (unlike labels, which are
+-- free-text with no id), so this follows the jira_fix_versions dimension+junction shape
+-- rather than the flat jira_issue_labels shape. Parsed out of fields.components, which
+-- jira_issues.components (JSON array) still also carries -- see transform.flatten_issue's
+-- caller in main.py for why that blob column is left populated as-is for now.
+IF OBJECT_ID('dbo.jira_components', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.jira_components (
+        component_id     BIGINT          NOT NULL PRIMARY KEY,
+        component_name   NVARCHAR(255)   NULL,
+        project_id       BIGINT          NULL,   -- no FK, same convention as jira_fix_versions.project_id
+        etl_loaded_at     DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME()
+    );
+END
+
+IF OBJECT_ID('dbo.jira_issue_components', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.jira_issue_components (
+        issue_id      BIGINT          NOT NULL,
+        issue_key     NVARCHAR(20)    NOT NULL,
+        component_id  BIGINT          NOT NULL,
+        etl_loaded_at DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_jira_issue_components PRIMARY KEY (issue_id, component_id)
+    );
+END
+
+-- Sprint (resolved at runtime by field name -- see main.py -- since the customfield_*
+-- id for "Sprint" is instance-specific). Not used by any current report, but captured now
+-- as future-proofing per product request. An issue can pass through multiple sprints over
+-- its life, so this follows the jira_fix_versions dimension+junction shape.
+IF OBJECT_ID('dbo.jira_sprints', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.jira_sprints (
+        sprint_id      BIGINT          NOT NULL PRIMARY KEY,
+        sprint_name    NVARCHAR(255)   NULL,
+        state          NVARCHAR(50)    NULL,   -- "future" | "active" | "closed"
+        board_id       BIGINT          NULL,
+        start_date     DATETIME2       NULL,
+        end_date       DATETIME2       NULL,
+        goal           NVARCHAR(MAX)   NULL,
+        etl_loaded_at  DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME()
+    );
+END
+
+IF OBJECT_ID('dbo.jira_issue_sprints', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.jira_issue_sprints (
+        issue_id      BIGINT          NOT NULL,
+        issue_key     NVARCHAR(20)    NOT NULL,
+        sprint_id     BIGINT          NOT NULL,
+        etl_loaded_at DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_jira_issue_sprints PRIMARY KEY (issue_id, sprint_id)
+    );
+END
+
+-- Team (resolved at runtime by field name, same reasoning as Sprint above). Unlike a
+-- normal custom field, Team references an Atlassian Team object (site-wide, not
+-- project-scoped) -- its value on an issue is an id pointer, not a plain option value.
+-- issue_id is the PK (not an IDENTITY row_id): an issue has at most one team at a time,
+-- so this is current-state, replaced wholesale per sync -- see db.replace_team().
+IF OBJECT_ID('dbo.jira_issue_team', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.jira_issue_team (
+        issue_id      BIGINT          NOT NULL PRIMARY KEY,
+        issue_key     NVARCHAR(20)    NOT NULL,
+        team_id       NVARCHAR(50)    NOT NULL,   -- Atlassian Team GUID, not a Jira internal numeric id
+        team_name     NVARCHAR(255)   NULL,       -- see transform.extract_team_row for why this is populated directly
+        etl_loaded_at DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME()
+    );
+END

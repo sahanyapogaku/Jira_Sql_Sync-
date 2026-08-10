@@ -39,7 +39,18 @@ def build_jql(full, days):
     return f'updated >= -{days}d ORDER BY updated ASC'
 
 
-def run(jql, conn, client, known_status_ids):
+def resolve_field_id(field_defs, field_name):
+    """Look up a customfield_* id by its display name (from client.list_fields()).
+
+    Used for Team/Sprint instead of hardcoding e.g. customfield_10020, since these ids
+    are assigned per Jira site and would silently break the mapping if this pipeline is
+    ever pointed at a different site. Returns None (with capture disabled for that field)
+    if no field with this name exists here.
+    """
+    return next((f["id"] for f in field_defs if f.get("name") == field_name), None)
+
+
+def run(jql, conn, client, known_status_ids, team_field_id, sprint_field_id):
     issue_batch = []
     project_batch = {}
     changelog_batch = []
@@ -55,7 +66,13 @@ def run(jql, conn, client, known_status_ids):
     attachment_batch = []
     hierarchy_batch = []
     label_batch = []
+    component_batch = {}
+    issue_component_batch = []
+    sprint_batch = {}
+    issue_sprint_batch = []
+    team_batch = []
     batch_issue_ids = []
+    exclude_custom_field_ids = {team_field_id} if team_field_id else None
 
     total_issues = 0
     total_changelog = 0
@@ -71,6 +88,7 @@ def run(jql, conn, client, known_status_ids):
         nonlocal worklog_batch, comment_batch, issuelink_batch, remotelink_batch
         nonlocal customfieldvalue_batch, fixversion_batch, issue_fixversion_batch, attachment_batch, hierarchy_batch
         nonlocal label_batch, batch_issue_ids
+        nonlocal component_batch, issue_component_batch, sprint_batch, issue_sprint_batch, team_batch
         nonlocal total_changelog, total_status_history, total_worklogs, total_comments, total_issuelinks
         nonlocal total_remotelinks, total_attachments
         if project_batch:
@@ -108,6 +126,14 @@ def run(jql, conn, client, known_status_ids):
         if fixversion_batch:
             db.upsert_fix_versions(conn, list(fixversion_batch.values()))
             fixversion_batch = {}
+        if component_batch:
+            # Must upsert before batch_issue_ids block below: jira_issue_components.component_id
+            # has no FK, but follows the same dimension-before-junction ordering as fix versions.
+            db.upsert_components(conn, list(component_batch.values()))
+            component_batch = {}
+        if sprint_batch:
+            db.upsert_sprints(conn, list(sprint_batch.values()))
+            sprint_batch = {}
         if attachment_batch:
             total_attachments += db.insert_attachments(conn, attachment_batch)
             attachment_batch = []
@@ -116,10 +142,16 @@ def run(jql, conn, client, known_status_ids):
             db.replace_issue_fix_versions(conn, batch_issue_ids, issue_fixversion_batch)
             db.replace_hierarchy(conn, batch_issue_ids, hierarchy_batch)
             db.replace_labels(conn, batch_issue_ids, label_batch)
+            db.replace_issue_components(conn, batch_issue_ids, issue_component_batch)
+            db.replace_issue_sprints(conn, batch_issue_ids, issue_sprint_batch)
+            db.replace_team(conn, batch_issue_ids, team_batch)
             customfieldvalue_batch = []
             issue_fixversion_batch = []
             hierarchy_batch = []
             label_batch = []
+            issue_component_batch = []
+            issue_sprint_batch = []
+            team_batch = []
             batch_issue_ids = []
 
     for issue in client.search_issues(jql, fields="*all"):
@@ -127,7 +159,7 @@ def run(jql, conn, client, known_status_ids):
         issue_key = issue["key"]
         fields = issue.get("fields", {})
 
-        issue_batch.append(transform.flatten_issue(issue))
+        issue_batch.append(transform.flatten_issue(issue, exclude_custom_field_ids=exclude_custom_field_ids))
         batch_issue_ids.append(issue_id)
 
         project_row = transform.extract_project_row(fields)
@@ -144,6 +176,18 @@ def run(jql, conn, client, known_status_ids):
         hierarchy_row = transform.extract_hierarchy_row(issue_id, issue_key, fields)
         if hierarchy_row:
             hierarchy_batch.append(hierarchy_row)
+
+        for comp_row in transform.extract_component_rows(fields):
+            component_batch[comp_row["component_id"]] = comp_row
+        issue_component_batch.extend(transform.extract_issue_component_links(issue_id, issue_key, fields))
+
+        for sprint_row in transform.extract_sprint_rows(fields, sprint_field_id):
+            sprint_batch[sprint_row["sprint_id"]] = sprint_row
+        issue_sprint_batch.extend(transform.extract_issue_sprint_links(issue_id, issue_key, fields, sprint_field_id))
+
+        team_row = transform.extract_team_row(issue_id, issue_key, fields, team_field_id)
+        if team_row:
+            team_batch.append(team_row)
 
         total_issues += 1
 
@@ -238,6 +282,15 @@ def main():
             {"field_id": f["id"], "field_name": f["name"], "field_type": f["type"]} for f in field_defs
         ])
 
+        # Resolved by name, not hardcoded, since these customfield_* ids are specific to
+        # this Jira site and would break if the pipeline is ever pointed at another one.
+        team_field_id = resolve_field_id(field_defs, "Team")
+        sprint_field_id = resolve_field_id(field_defs, "Sprint")
+        if not team_field_id:
+            logger.warning("No custom field named 'Team' found on this site — Team capture disabled for this run")
+        if not sprint_field_id:
+            logger.warning("No custom field named 'Sprint' found on this site — Sprint capture disabled for this run")
+
         statuses = client.list_statuses()
         known_status_ids = {s["status_id"] for s in statuses}
         categories_by_id = {}
@@ -255,7 +308,7 @@ def main():
             for s in statuses
         ])
 
-        run(jql, conn, client, known_status_ids)
+        run(jql, conn, client, known_status_ids, team_field_id, sprint_field_id)
 
     except JiraAuthError as exc:
         logger.critical("Jira authentication failed: %s", exc)

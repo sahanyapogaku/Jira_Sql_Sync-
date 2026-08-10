@@ -111,8 +111,42 @@ current set, not a diff (see `db.replace_*`).
 - **`jira_issue_hierarchy`** — one row per issue with a parent (subtask ->
   parent task, or story/task -> epic), keyed on `child_issue_id`. Replaced
   wholesale per issue on each sync since an issue has at most one parent.
+- **`jira_components`** / **`jira_issue_components`** — the component
+  dimension and its issue junction table, same dimension+junction shape as
+  fix versions (components carry a stable id, unlike labels). The junction
+  is replaced wholesale per issue on each sync. `jira_issues.components`
+  (JSON array) is left populated as-is alongside this for now — see
+  "Open questions" below.
+- **`jira_sprints`** / **`jira_issue_sprints`** — the sprint dimension and
+  its issue junction table (an issue can pass through multiple sprints over
+  its life), same dimension+junction shape as fix versions. Not used by any
+  report today; captured as future-proofing. The Sprint field's
+  `customfield_*` id is resolved at runtime by name (`main.resolve_field_id`)
+  rather than hardcoded, since that id is specific to this Jira site.
+- **`jira_issue_team`** — one row per issue with a Team set, keyed on
+  `issue_id` (an issue has at most one team). Team is an Atlassian Team
+  reference (site-wide, not project-scoped), not a normal custom field — its
+  `customfield_*` id is likewise resolved at runtime by name. `team_name` is
+  populated directly from the field's own payload (confirmed to already
+  include a display name on this site), so no separate call to the
+  Atlassian Teams API is made.
 
 Full DDL: see `schema.sql`.
+
+## Open questions
+
+- **`jira_issues.custom_fields_json` / `.components` blob columns** — now
+  partially duplicated by `jira_custom_field_values`, `jira_issue_components`,
+  and `jira_issue_labels`. Whether to keep these JSON blobs as a
+  denormalized safety net or drop them is still undecided; within this
+  codebase nothing reads them back out (they're write-only), but an external
+  consumer (BI tool, ad-hoc query) might. Left in place, still populated,
+  pending that decision.
+- **`jira_custom_field_values` for the "Approvals" field**
+  (`customfield_10046`) — currently stored as one large JSON blob per issue
+  (up to ~37KB). Extracting `approval_status` / `final_decision` /
+  `approver_id` (etc.) into real columns has been proposed but not built —
+  see the custom-field-formatting investigation notes.
 
 ## Files
 

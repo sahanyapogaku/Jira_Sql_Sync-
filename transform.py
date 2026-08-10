@@ -28,15 +28,22 @@ def _safe_get(d, *keys, default=None):
     return cur
 
 
-def _extract_custom_fields(fields):
-    return {k: v for k, v in fields.items() if k.startswith("customfield_")}
+def _extract_custom_fields(fields, exclude=None):
+    exclude = exclude or set()
+    return {k: v for k, v in fields.items() if k.startswith("customfield_") and k not in exclude}
 
 
-def flatten_issue(issue):
-    """Map one /search or /issue payload into a jira_issues row dict."""
+def flatten_issue(issue, exclude_custom_field_ids=None):
+    """Map one /search or /issue payload into a jira_issues row dict.
+
+    exclude_custom_field_ids: field ids to leave out of custom_fields_json because they
+    already have dedicated handling elsewhere (currently just Team -- see main.py). Sprint
+    is deliberately NOT excluded here: nothing in the ticket asked for it to stop appearing
+    in this catch-all blob, only for it to also gain a dedicated table.
+    """
     fields = issue.get("fields", {}) or {}
 
-    custom_fields = _extract_custom_fields(fields)
+    custom_fields = _extract_custom_fields(fields, exclude=exclude_custom_field_ids)
 
     components = [c.get("name") for c in (fields.get("components") or [])]
     fix_versions = [v.get("name") for v in (fields.get("fixVersions") or [])]
@@ -212,11 +219,21 @@ def extract_project_row(fields):
 
 
 def extract_custom_field_value_rows(issue_id, issue_key, fields):
-    """An issue's customfield_* entries -> list of jira_custom_field_values row dicts (skips nulls)."""
+    """An issue's customfield_* entries -> list of jira_custom_field_values row dicts (skips nulls).
+
+    Values stored as Atlassian Document Format (ADF) rich text -- confirmed present under
+    15 different field ids on this site, e.g. "Considered Options"/"Decision" (not just
+    those two) -- are flattened to plain text here, the same approach already used for
+    comment/worklog bodies, rather than stored as raw ADF JSON. Detection is generic
+    (any dict value with type == "doc"), not a hardcoded field-id list, since which fields
+    use ADF is a per-site admin choice, same reasoning as the Sprint/Team field-id lookups.
+    """
     rows = []
     for field_id, value in _extract_custom_fields(fields).items():
         if value is None:
             continue
+        if isinstance(value, dict) and value.get("type") == "doc":
+            value = _adf_to_text(value)
         rows.append({
             "issue_id": issue_id,
             "issue_key": issue_key,
@@ -318,4 +335,105 @@ def extract_hierarchy_row(issue_id, issue_key, fields):
         "parent_issue_id": int(parent["id"]),
         "parent_issue_key": parent.get("key"),
         "relationship_type": "subtask" if is_subtask else "epic_child",
+    }
+
+
+def extract_component_rows(fields):
+    """An issue's fields.components -> list of jira_components row dicts (the component
+    dimension itself). Mirrors extract_fix_version_rows: project_id comes from the issue's
+    own project, not from the component object (Jira's issue payload only returns
+    {id, name, self} for each component, not full project detail).
+    """
+    rows = []
+    project_id = _safe_get(fields, "project", "id")
+    for c in fields.get("components") or []:
+        if not c.get("id"):
+            continue
+        rows.append({
+            "component_id": int(c["id"]),
+            "component_name": c.get("name"),
+            "project_id": int(project_id) if project_id else None,
+        })
+    return rows
+
+
+def extract_issue_component_links(issue_id, issue_key, fields):
+    """An issue's fields.components -> list of jira_issue_components junction row dicts."""
+    rows = []
+    for c in fields.get("components") or []:
+        if not c.get("id"):
+            continue
+        rows.append({
+            "issue_id": issue_id,
+            "issue_key": issue_key,
+            "component_id": int(c["id"]),
+        })
+    return rows
+
+
+def extract_sprint_rows(fields, sprint_field_id):
+    """An issue's Sprint field -> list of jira_sprints row dicts (the sprint dimension
+    itself). sprint_field_id is resolved at runtime by the caller (see
+    main.resolve_field_id) since its customfield_* id is instance-specific -- confirmed as
+    customfield_10020 on this site, but never hardcoded here.
+    """
+    if not sprint_field_id:
+        return []
+    rows = []
+    for s in fields.get(sprint_field_id) or []:
+        if not s.get("id"):
+            continue
+        rows.append({
+            "sprint_id": int(s["id"]),
+            "sprint_name": s.get("name"),
+            "state": s.get("state"),
+            "board_id": int(s["boardId"]) if s.get("boardId") is not None else None,
+            "start_date": s.get("startDate"),
+            "end_date": s.get("endDate"),
+            "goal": s.get("goal"),
+        })
+    return rows
+
+
+def extract_issue_sprint_links(issue_id, issue_key, fields, sprint_field_id):
+    """An issue's Sprint field -> list of jira_issue_sprints junction row dicts."""
+    if not sprint_field_id:
+        return []
+    rows = []
+    for s in fields.get(sprint_field_id) or []:
+        if not s.get("id"):
+            continue
+        rows.append({
+            "issue_id": issue_id,
+            "issue_key": issue_key,
+            "sprint_id": int(s["id"]),
+        })
+    return rows
+
+
+def extract_team_row(issue_id, issue_key, fields, team_field_id):
+    """An issue's Team field -> a jira_issue_team row dict, or None if unset or the Team
+    field isn't configured on this site. team_field_id is resolved at runtime by the
+    caller (see main.resolve_field_id) -- confirmed as customfield_10001 on this site, but
+    never hardcoded here, since it's an instance-specific id like Sprint's.
+
+    NOTE ON team_name: a normal Atlassian Team reference would need a call to the separate
+    Teams API (different base URL/auth surface than Jira issues) to resolve an id to a
+    display name -- that call is deliberately NOT made here per the ticket. However,
+    confirmed against live data on this site, the Team field's value already embeds "name"
+    inline (e.g. {"id": "...", "name": "Product Engineering", ...}), so team_name below is
+    populated directly from the same payload at zero extra API cost. Flagged explicitly in
+    the accompanying report since it changes the "is this worth an extra call" calculus the
+    ticket assumed -- no extra call is needed either way.
+    """
+    if not team_field_id:
+        return None
+    team = fields.get(team_field_id)
+    if not team or not team.get("id"):
+        return None
+    return {
+        "issue_id": issue_id,
+        "issue_key": issue_key,
+        "team_id": str(team["id"]),
+        "team_name": team.get("name"),
     }

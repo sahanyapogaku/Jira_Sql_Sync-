@@ -107,6 +107,18 @@ HIERARCHY_COLUMNS = [
     "child_issue_id", "child_issue_key", "parent_issue_id", "parent_issue_key", "relationship_type",
 ]
 
+COMPONENT_COLUMNS = ["component_id", "component_name", "project_id"]
+
+ISSUE_COMPONENT_COLUMNS = ["issue_id", "issue_key", "component_id"]
+
+SPRINT_COLUMNS = ["sprint_id", "sprint_name", "state", "board_id", "start_date", "end_date", "goal"]
+
+SPRINT_DATETIME_COLS = ("start_date", "end_date")
+
+ISSUE_SPRINT_COLUMNS = ["issue_id", "issue_key", "sprint_id"]
+
+TEAM_COLUMNS = ["issue_id", "issue_key", "team_id", "team_name"]
+
 STATUS_CATEGORY_COLUMNS = ["category_id", "category_key", "category_name", "color_name"]
 
 STATUS_COLUMNS = ["status_id", "status_name", "category_id"]
@@ -525,6 +537,69 @@ def upsert_fix_versions(conn, rows):
     return len(rows)
 
 
+def upsert_components(conn, rows):
+    if not rows:
+        return 0
+
+    cur = conn.cursor()
+    cur.execute("""
+        IF OBJECT_ID('tempdb..#stg_components') IS NOT NULL DROP TABLE #stg_components;
+        SELECT TOP 0 * INTO #stg_components FROM dbo.jira_components;
+        ALTER TABLE #stg_components ALTER COLUMN etl_loaded_at DATETIME2 NULL;
+    """)
+    placeholders = ", ".join("?" for _ in COMPONENT_COLUMNS)
+    insert_sql = f"INSERT INTO #stg_components ({', '.join(COMPONENT_COLUMNS)}) VALUES ({placeholders})"
+    cur.executemany(insert_sql, _rows_to_tuples(rows, COMPONENT_COLUMNS))
+
+    set_clause = ", ".join(f"t.{c} = s.{c}" for c in COMPONENT_COLUMNS if c != "component_id")
+    insert_cols = ", ".join(COMPONENT_COLUMNS)
+    insert_vals = ", ".join(f"s.{c}" for c in COMPONENT_COLUMNS)
+    cur.execute(f"""
+        MERGE dbo.jira_components AS t
+        USING #stg_components AS s
+        ON t.component_id = s.component_id
+        WHEN MATCHED THEN
+            UPDATE SET {set_clause}, t.etl_loaded_at = SYSUTCDATETIME()
+        WHEN NOT MATCHED THEN
+            INSERT ({insert_cols}) VALUES ({insert_vals});
+    """)
+    conn.commit()
+    logger.info("Upserted %d component rows", len(rows))
+    return len(rows)
+
+
+def upsert_sprints(conn, rows):
+    if not rows:
+        return 0
+    _coerce_datetimes(rows, SPRINT_DATETIME_COLS)
+
+    cur = conn.cursor()
+    cur.execute("""
+        IF OBJECT_ID('tempdb..#stg_sprints') IS NOT NULL DROP TABLE #stg_sprints;
+        SELECT TOP 0 * INTO #stg_sprints FROM dbo.jira_sprints;
+        ALTER TABLE #stg_sprints ALTER COLUMN etl_loaded_at DATETIME2 NULL;
+    """)
+    placeholders = ", ".join("?" for _ in SPRINT_COLUMNS)
+    insert_sql = f"INSERT INTO #stg_sprints ({', '.join(SPRINT_COLUMNS)}) VALUES ({placeholders})"
+    cur.executemany(insert_sql, _rows_to_tuples(rows, SPRINT_COLUMNS))
+
+    set_clause = ", ".join(f"t.{c} = s.{c}" for c in SPRINT_COLUMNS if c != "sprint_id")
+    insert_cols = ", ".join(SPRINT_COLUMNS)
+    insert_vals = ", ".join(f"s.{c}" for c in SPRINT_COLUMNS)
+    cur.execute(f"""
+        MERGE dbo.jira_sprints AS t
+        USING #stg_sprints AS s
+        ON t.sprint_id = s.sprint_id
+        WHEN MATCHED THEN
+            UPDATE SET {set_clause}, t.etl_loaded_at = SYSUTCDATETIME()
+        WHEN NOT MATCHED THEN
+            INSERT ({insert_cols}) VALUES ({insert_vals});
+    """)
+    conn.commit()
+    logger.info("Upserted %d sprint rows", len(rows))
+    return len(rows)
+
+
 def insert_attachments(conn, rows):
     if not rows:
         return 0
@@ -646,6 +721,96 @@ def replace_issue_fix_versions(conn, issue_ids, rows):
 
     conn.commit()
     logger.info("Replaced fix-version links for %d issues (%d links loaded)", len(issue_ids), len(rows))
+    return len(rows)
+
+
+def replace_issue_components(conn, issue_ids, rows):
+    """Replace component links for the given issue_ids. Same rationale as
+    replace_issue_fix_versions: an issue's component set can change on re-sync, so this
+    clears stale links rather than only appending new ones.
+    """
+    if not issue_ids:
+        return 0
+    cur = conn.cursor()
+    placeholders = ", ".join("?" for _ in issue_ids)
+    cur.execute(f"DELETE FROM dbo.jira_issue_components WHERE issue_id IN ({placeholders})", issue_ids)
+
+    if rows:
+        cur.execute("""
+            IF OBJECT_ID('tempdb..#stg_ic') IS NOT NULL DROP TABLE #stg_ic;
+            SELECT TOP 0 * INTO #stg_ic FROM dbo.jira_issue_components;
+            ALTER TABLE #stg_ic ALTER COLUMN etl_loaded_at DATETIME2 NULL;
+        """)
+        ph = ", ".join("?" for _ in ISSUE_COMPONENT_COLUMNS)
+        cur.executemany(
+            f"INSERT INTO #stg_ic ({', '.join(ISSUE_COMPONENT_COLUMNS)}) VALUES ({ph})",
+            _rows_to_tuples(rows, ISSUE_COMPONENT_COLUMNS),
+        )
+        cols = ", ".join(ISSUE_COMPONENT_COLUMNS)
+        cur.execute(f"INSERT INTO dbo.jira_issue_components ({cols}) SELECT {cols} FROM #stg_ic")
+
+    conn.commit()
+    logger.info("Replaced component links for %d issues (%d links loaded)", len(issue_ids), len(rows))
+    return len(rows)
+
+
+def replace_issue_sprints(conn, issue_ids, rows):
+    """Replace sprint links for the given issue_ids. Same rationale as
+    replace_issue_fix_versions: an issue's sprint history can grow (or be corrected) on
+    re-sync, so this clears stale links rather than only appending new ones.
+    """
+    if not issue_ids:
+        return 0
+    cur = conn.cursor()
+    placeholders = ", ".join("?" for _ in issue_ids)
+    cur.execute(f"DELETE FROM dbo.jira_issue_sprints WHERE issue_id IN ({placeholders})", issue_ids)
+
+    if rows:
+        cur.execute("""
+            IF OBJECT_ID('tempdb..#stg_is') IS NOT NULL DROP TABLE #stg_is;
+            SELECT TOP 0 * INTO #stg_is FROM dbo.jira_issue_sprints;
+            ALTER TABLE #stg_is ALTER COLUMN etl_loaded_at DATETIME2 NULL;
+        """)
+        ph = ", ".join("?" for _ in ISSUE_SPRINT_COLUMNS)
+        cur.executemany(
+            f"INSERT INTO #stg_is ({', '.join(ISSUE_SPRINT_COLUMNS)}) VALUES ({ph})",
+            _rows_to_tuples(rows, ISSUE_SPRINT_COLUMNS),
+        )
+        cols = ", ".join(ISSUE_SPRINT_COLUMNS)
+        cur.execute(f"INSERT INTO dbo.jira_issue_sprints ({cols}) SELECT {cols} FROM #stg_is")
+
+    conn.commit()
+    logger.info("Replaced sprint links for %d issues (%d links loaded)", len(issue_ids), len(rows))
+    return len(rows)
+
+
+def replace_team(conn, issue_ids, rows):
+    """Replace the team link for the given issue_ids. Same rationale as replace_hierarchy:
+    an issue's team can change or be cleared on re-sync, and an issue has at most one team
+    at a time, so stale rows must be cleared rather than only appended to.
+    """
+    if not issue_ids:
+        return 0
+    cur = conn.cursor()
+    placeholders = ", ".join("?" for _ in issue_ids)
+    cur.execute(f"DELETE FROM dbo.jira_issue_team WHERE issue_id IN ({placeholders})", issue_ids)
+
+    if rows:
+        cur.execute("""
+            IF OBJECT_ID('tempdb..#stg_team') IS NOT NULL DROP TABLE #stg_team;
+            SELECT TOP 0 * INTO #stg_team FROM dbo.jira_issue_team;
+            ALTER TABLE #stg_team ALTER COLUMN etl_loaded_at DATETIME2 NULL;
+        """)
+        ph = ", ".join("?" for _ in TEAM_COLUMNS)
+        cur.executemany(
+            f"INSERT INTO #stg_team ({', '.join(TEAM_COLUMNS)}) VALUES ({ph})",
+            _rows_to_tuples(rows, TEAM_COLUMNS),
+        )
+        cols = ", ".join(TEAM_COLUMNS)
+        cur.execute(f"INSERT INTO dbo.jira_issue_team ({cols}) SELECT {cols} FROM #stg_team")
+
+    conn.commit()
+    logger.info("Replaced team links for %d issues (%d teams loaded)", len(issue_ids), len(rows))
     return len(rows)
 
 
