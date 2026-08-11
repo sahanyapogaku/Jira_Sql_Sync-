@@ -161,8 +161,19 @@ Full DDL: see `schema.sql`.
   network/5xx errors; raises immediately on 401/403.
 - `transform.py` — raw Jira JSON -> row dicts for every table.
 - `db.py` — MSSQL connection, schema bootstrap, batched MERGE/insert/replace logic.
-- `main.py` — CLI entrypoint (`--full` / `--incremental --days N`), logging.
+  Also retries transient connection drops with backoff (see "Error handling").
+- `main.py` — CLI entrypoint (`--full` / `--incremental --days N`), logging,
+  and the run-level retry loop around a transient MSSQL failure.
 - `schema.sql` — CREATE TABLE DDL (idempotent, guarded by `IF OBJECT_ID(...) IS NULL`).
+- `pipeline_logs.sql` — DDL for `dbo.pipeline_logs`, a run-level log table
+  (start/end time, status, rows processed, error message) for monitoring in
+  Grafana. Auto-applied at startup via `db.open_logging_connection`.
+- `grafana_queries.sql` — ready-to-paste panel queries for a Grafana
+  dashboard against `pipeline_logs` (last-run status, success rate, run
+  duration, recent failures, stuck-`Running` detection, etc).
+- `TROUBLESHOOTING.md` — catalog of failure modes actually seen in this
+  pipeline (MSSQL connection drops, Jira auth/rate-limit errors, etc.), what
+  handles each automatically, and what to check manually when it doesn't.
 
 ## Error handling
 
@@ -173,3 +184,9 @@ Full DDL: see `schema.sql`.
 - A single issue's changelog or worklog fetch failing (after retries) is
   logged as a warning and skipped, rather than aborting the entire run — the
   issue row itself still loads.
+- **Transient MSSQL connection drops** (network blip, VPN drop, machine
+  sleep) are retried with backoff at two levels: `db.connect()` itself
+  retries up to 3 times, and `main.py` retries the *entire run* up to 3
+  times 30s apart if the failure is transient — safe because every write in
+  this pipeline is idempotent. See `TROUBLESHOOTING.md` for the full catalog
+  of failure modes and what to do when retries aren't enough.
