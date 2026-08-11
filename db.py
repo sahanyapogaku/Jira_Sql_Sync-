@@ -8,7 +8,8 @@ event keys, so re-running an incremental sync never duplicates rows.
 
 import logging
 import os
-from datetime import timezone
+import time
+from datetime import datetime, timezone
 
 import pyodbc
 from dateutil import parser as dateparser
@@ -16,8 +17,24 @@ from dateutil import parser as dateparser
 logger = logging.getLogger("jira_etl.db")
 
 SCHEMA_PATH = os.path.join(os.path.dirname(__file__), "schema.sql")
+PIPELINE_LOGS_SCHEMA_PATH = os.path.join(os.path.dirname(__file__), "pipeline_logs.sql")
+
+# SQLSTATEs indicating a dropped/unreachable connection (network blip, VPN drop, machine
+# sleep) rather than a real SQL problem (bad syntax, constraint violation) -- the same
+# fail-fast-vs-retry split jira_client.py already makes for 401/403 vs 429/5xx. Seen live:
+# '08S01' (TCP Provider: connection forcibly closed) and '08001' (Named Pipes Provider:
+# could not open a connection) after this machine's network dropped mid-sync.
+TRANSIENT_SQLSTATES = {"08S01", "08001", "08S02", "HYT00", "HYT01"}
+CONNECT_MAX_RETRIES = 3
+CONNECT_BASE_BACKOFF_SECONDS = 5
+
+
+def is_transient_connection_error(exc):
+    sqlstate = exc.args[0] if isinstance(exc, pyodbc.Error) and exc.args else None
+    return sqlstate in TRANSIENT_SQLSTATES
 
 ISSUE_DATETIME_COLS = ("created", "updated", "resolutiondate")
+ISSUE_DATE_COLS = ("due_date",)
 CHANGELOG_DATETIME_COLS = ("changed_at",)
 WORKLOG_DATETIME_COLS = ("started_at", "worklog_created", "worklog_updated")
 COMMENT_DATETIME_COLS = ("comment_created", "comment_updated")
@@ -66,8 +83,24 @@ def build_connection_string():
 
 
 def connect():
-    conn = pyodbc.connect(build_connection_string(), autocommit=False)
-    return conn
+    """Open an MSSQL connection, retrying transient failures with backoff -- mirrors
+    jira_client.py's retry philosophy: a network blip right after an outage (confirmed
+    live: reconnect attempts can themselves fail for a few seconds after connectivity
+    nominally returns) is worth retrying briefly; anything else (bad credentials, unknown
+    host) should still fail immediately rather than retry into a wall.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return pyodbc.connect(build_connection_string(), autocommit=False)
+        except pyodbc.Error as exc:
+            if attempt >= CONNECT_MAX_RETRIES or not is_transient_connection_error(exc):
+                raise
+            backoff = CONNECT_BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            logger.warning("Transient MSSQL connection error on connect (attempt %d/%d): %s — retrying in %ds",
+                           attempt, CONNECT_MAX_RETRIES, exc, backoff)
+            time.sleep(backoff)
 
 
 def apply_schema(conn):
@@ -79,10 +112,83 @@ def apply_schema(conn):
     logger.info("Schema verified/applied from %s", SCHEMA_PATH)
 
 
+def apply_pipeline_logs_schema(conn):
+    with open(PIPELINE_LOGS_SCHEMA_PATH, "r", encoding="utf-8") as f:
+        script = f.read()
+    cur = conn.cursor()
+    cur.execute(script)
+    conn.commit()
+    logger.info("pipeline_logs schema verified/applied from %s", PIPELINE_LOGS_SCHEMA_PATH)
+
+
+def open_logging_connection():
+    """A dedicated connection for pipeline_logs, separate from the main data connection
+    used for the Jira sync itself. Kept separate so that if the main connection ends up
+    mid-transaction after a failure, writing the pipeline_logs failure row here isn't
+    blocked by that state. Uses the same connection details/credentials as connect() --
+    see build_connection_string() -- nothing new to configure.
+
+    Never raises: returns None (with run-level DB logging disabled for this run) and logs
+    a warning if a connection can't be established or the pipeline_logs table can't be
+    verified, per the "logging failure must not crash the pipeline" requirement.
+    """
+    try:
+        conn = connect()
+        apply_pipeline_logs_schema(conn)
+        return conn
+    except Exception:
+        logger.warning("Could not establish pipeline_logs connection; run-level DB logging disabled for this run",
+                        exc_info=True)
+        return None
+
+
+def start_pipeline_log(conn, pipeline_name):
+    """Insert a 'Running' row into pipeline_logs and return its log_id, or None if this
+    fails (or conn is None because open_logging_connection() already failed) -- never
+    raises, per the "logging failure must not crash the pipeline" requirement.
+    """
+    if conn is None:
+        return None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO dbo.pipeline_logs (pipeline_name, start_time, status) "
+            "OUTPUT INSERTED.log_id VALUES (?, ?, ?)",
+            pipeline_name, datetime.utcnow(), "Running",
+        )
+        log_id = cur.fetchone()[0]
+        conn.commit()
+        return log_id
+    except Exception:
+        logger.warning("Failed to write pipeline_logs start row", exc_info=True)
+        return None
+
+
+def finish_pipeline_log(conn, log_id, status, rows_processed=None, error_message=None):
+    """Update the pipeline_logs row for this run with its outcome. No-op if conn/log_id
+    are None (start already failed). Never raises -- logs a warning instead, per the
+    "logging failure must not crash the pipeline" requirement.
+    """
+    if conn is None or log_id is None:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE dbo.pipeline_logs SET end_time = ?, status = ?, rows_processed = ?, error_message = ? "
+            "WHERE log_id = ?",
+            datetime.utcnow(), status, rows_processed, error_message, log_id,
+        )
+        conn.commit()
+    except Exception:
+        logger.warning("Failed to write pipeline_logs end row", exc_info=True)
+
+
 ISSUE_COLUMNS = [
     "issue_id", "issue_key", "project_id", "project_key", "project_name", "issue_type", "summary",
     "status", "status_category", "priority", "assignee_account_id", "assignee_name",
     "reporter_account_id", "reporter_name", "created", "updated", "resolutiondate",
+    "due_date", "environment", "security_level",
+    "original_estimate_seconds", "remaining_estimate_seconds", "time_spent_seconds",
     "labels", "components", "fix_versions", "custom_fields_json", "raw_json",
 ]
 
@@ -167,6 +273,7 @@ def upsert_issues(conn, rows):
     if not rows:
         return 0
     _coerce_datetimes(rows, ISSUE_DATETIME_COLS)
+    _coerce_dates(rows, ISSUE_DATE_COLS)
 
     cur = conn.cursor()
     cur.execute("""

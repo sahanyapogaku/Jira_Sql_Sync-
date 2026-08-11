@@ -10,6 +10,7 @@ import argparse
 import logging
 import os
 import sys
+import time
 
 from dotenv import load_dotenv
 
@@ -20,6 +21,16 @@ from jira_client import JiraAuthError, JiraAPIError, JiraClient
 logger = logging.getLogger("jira_etl")
 
 BATCH_SIZE = 200
+PIPELINE_NAME = "jira_etl"
+
+# A transient MSSQL connection drop (network blip, VPN drop, machine sleep -- confirmed
+# live: this pipeline has hit both) kills whatever connection was open mid-write with no
+# way to resume that exact write. Retrying the whole run from scratch is safe (every write
+# here is idempotent -- see README's "Data model" section) even if wasteful for a --full
+# sync that was most of the way through. Not retried for JiraAuthError/JiraAPIError or any
+# non-transient error -- those fail fast, same as before.
+DB_RETRY_MAX_ATTEMPTS = 3
+DB_RETRY_BACKOFF_SECONDS = 30
 
 
 def setup_logging(log_file):
@@ -238,6 +249,7 @@ def run(jql, conn, client, known_status_ids, team_field_id, sprint_field_id):
         total_issues, total_changelog, total_status_history, total_worklogs,
         total_comments, total_issuelinks, total_remotelinks, total_attachments,
     )
+    return total_issues
 
 
 def main():
@@ -265,59 +277,89 @@ def main():
 
     client = JiraClient(os.environ["JIRA_URL"], os.environ["JIRA_EMAIL"], os.environ["JIRA_API_TOKEN"])
 
-    try:
-        conn = db.connect()
-    except Exception:
-        logger.critical("Failed to connect to MSSQL", exc_info=True)
-        sys.exit(1)
+    for attempt in range(1, DB_RETRY_MAX_ATTEMPTS + 1):
+        if attempt > 1:
+            logger.info("Retry attempt %d/%d: restarting the run from scratch", attempt, DB_RETRY_MAX_ATTEMPTS)
 
-    try:
-        db.apply_schema(conn)
+        try:
+            conn = db.connect()
+        except Exception:
+            logger.critical("Failed to connect to MSSQL", exc_info=True)
+            sys.exit(1)
 
-        projects = client.list_projects()
-        logger.info("Scope: ALL %d discovered projects (no project filter applied to JQL)", len(projects))
+        # Separate connection/table from the main sync -- see db.open_logging_connection
+        # for why. Never raises: log_conn/log_id are None if this fails, and every call
+        # below is a safe no-op in that case, so a logging failure can't take down the
+        # actual pipeline.
+        log_conn = db.open_logging_connection()
+        log_id = db.start_pipeline_log(log_conn, PIPELINE_NAME)
 
-        field_defs = client.list_fields()
-        db.upsert_field_definitions(conn, [
-            {"field_id": f["id"], "field_name": f["name"], "field_type": f["type"]} for f in field_defs
-        ])
+        total_issues = 0
+        try:
+            db.apply_schema(conn)
 
-        # Resolved by name, not hardcoded, since these customfield_* ids are specific to
-        # this Jira site and would break if the pipeline is ever pointed at another one.
-        team_field_id = resolve_field_id(field_defs, "Team")
-        sprint_field_id = resolve_field_id(field_defs, "Sprint")
-        if not team_field_id:
-            logger.warning("No custom field named 'Team' found on this site — Team capture disabled for this run")
-        if not sprint_field_id:
-            logger.warning("No custom field named 'Sprint' found on this site — Sprint capture disabled for this run")
+            projects = client.list_projects()
+            logger.info("Scope: ALL %d discovered projects (no project filter applied to JQL)", len(projects))
 
-        statuses = client.list_statuses()
-        known_status_ids = {s["status_id"] for s in statuses}
-        categories_by_id = {}
-        for s in statuses:
-            if s["category_id"] is not None:
-                categories_by_id[s["category_id"]] = {
-                    "category_id": s["category_id"],
-                    "category_key": s["category_key"],
-                    "category_name": s["category_name"],
-                    "color_name": s["color_name"],
-                }
-        db.upsert_status_categories(conn, list(categories_by_id.values()))
-        db.upsert_statuses(conn, [
-            {"status_id": s["status_id"], "status_name": s["status_name"], "category_id": s["category_id"]}
-            for s in statuses
-        ])
+            field_defs = client.list_fields()
+            db.upsert_field_definitions(conn, [
+                {"field_id": f["id"], "field_name": f["name"], "field_type": f["type"]} for f in field_defs
+            ])
 
-        run(jql, conn, client, known_status_ids, team_field_id, sprint_field_id)
+            # Resolved by name, not hardcoded, since these customfield_* ids are specific
+            # to this Jira site and would break if the pipeline is ever pointed at another.
+            team_field_id = resolve_field_id(field_defs, "Team")
+            sprint_field_id = resolve_field_id(field_defs, "Sprint")
+            if not team_field_id:
+                logger.warning("No custom field named 'Team' found on this site — Team capture disabled for this run")
+            if not sprint_field_id:
+                logger.warning("No custom field named 'Sprint' found on this site — Sprint capture disabled for this run")
 
-    except JiraAuthError as exc:
-        logger.critical("Jira authentication failed: %s", exc)
-        sys.exit(1)
-    except JiraAPIError as exc:
-        logger.critical("Unrecoverable Jira API error: %s", exc)
-        sys.exit(1)
-    finally:
-        conn.close()
+            statuses = client.list_statuses()
+            known_status_ids = {s["status_id"] for s in statuses}
+            categories_by_id = {}
+            for s in statuses:
+                if s["category_id"] is not None:
+                    categories_by_id[s["category_id"]] = {
+                        "category_id": s["category_id"],
+                        "category_key": s["category_key"],
+                        "category_name": s["category_name"],
+                        "color_name": s["color_name"],
+                    }
+            db.upsert_status_categories(conn, list(categories_by_id.values()))
+            db.upsert_statuses(conn, [
+                {"status_id": s["status_id"], "status_name": s["status_name"], "category_id": s["category_id"]}
+                for s in statuses
+            ])
+
+            total_issues = run(jql, conn, client, known_status_ids, team_field_id, sprint_field_id)
+            db.finish_pipeline_log(log_conn, log_id, status="Success", rows_processed=total_issues)
+            return
+
+        except JiraAuthError as exc:
+            logger.critical("Jira authentication failed: %s", exc)
+            db.finish_pipeline_log(log_conn, log_id, status="Failed", rows_processed=total_issues, error_message=str(exc))
+            sys.exit(1)
+        except JiraAPIError as exc:
+            logger.critical("Unrecoverable Jira API error: %s", exc)
+            db.finish_pipeline_log(log_conn, log_id, status="Failed", rows_processed=total_issues, error_message=str(exc))
+            sys.exit(1)
+        except Exception as exc:
+            db.finish_pipeline_log(log_conn, log_id, status="Failed", rows_processed=total_issues, error_message=str(exc))
+            if db.is_transient_connection_error(exc) and attempt < DB_RETRY_MAX_ATTEMPTS:
+                logger.warning(
+                    "Transient MSSQL connection error (attempt %d/%d): %s — retrying the whole run in %ds "
+                    "(safe: every write here is idempotent, see README)",
+                    attempt, DB_RETRY_MAX_ATTEMPTS, exc, DB_RETRY_BACKOFF_SECONDS,
+                )
+                time.sleep(DB_RETRY_BACKOFF_SECONDS)
+                continue
+            logger.critical("Unhandled pipeline error", exc_info=True)
+            raise
+        finally:
+            conn.close()
+            if log_conn:
+                log_conn.close()
 
 
 if __name__ == "__main__":

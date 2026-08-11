@@ -17,6 +17,17 @@ def _adf_to_text(node):
     return None
 
 
+def _flatten_environment(value):
+    """fields.environment -- schema.type "string" like Description, which doesn't rule out
+    ADF rich text (confirmed nowhere set on this site today, so this is defensive, not
+    verified against a live example). Same generic ADF detection as
+    extract_custom_field_value_rows.
+    """
+    if isinstance(value, dict) and value.get("type") == "doc":
+        return _adf_to_text(value)
+    return value
+
+
 def _safe_get(d, *keys, default=None):
     cur = d
     for k in keys:
@@ -68,6 +79,12 @@ def flatten_issue(issue, exclude_custom_field_ids=None):
         "created": fields.get("created"),
         "updated": fields.get("updated"),
         "resolutiondate": fields.get("resolutiondate"),
+        "due_date": fields.get("duedate"),
+        "environment": _flatten_environment(fields.get("environment")),
+        "security_level": _safe_get(fields, "security", "name"),
+        "original_estimate_seconds": fields.get("timeoriginalestimate"),
+        "remaining_estimate_seconds": fields.get("timeestimate"),
+        "time_spent_seconds": fields.get("timespent"),
         "labels": json.dumps(labels),
         "components": json.dumps(components),
         "fix_versions": json.dumps(fix_versions),

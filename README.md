@@ -67,10 +67,15 @@ wholesale-replaced per issue on every sync since Jira reports only the
 current set, not a diff (see `db.replace_*`).
 
 - **`jira_issues`** : one row per issue, current state. Standard fields are
-  flattened into columns; every `customfield_*` key is preserved as-is (no
-  name resolution) in `custom_fields_json`, since custom fields vary heavily
-  by project/issue type. `raw_json` keeps the full original payload as a
-  safety net. Upserted via `MERGE` keyed on `issue_id`.
+  flattened into columns, including `due_date`, `environment`, and
+  `security_level` (the last flattened to just its name, matching
+  `priority`/`status_category`); every `customfield_*` key is preserved as-is
+  (no name resolution) in `custom_fields_json`, since custom fields vary
+  heavily by project/issue type. `raw_json` keeps the full original payload
+  as a safety net. Upserted via `MERGE` keyed on `issue_id`. Note: as of this
+  writing, no issue on this site actually sets `environment` or
+  `security_level` (0 of 3,579) — the columns are schema-ready but unverified
+  against real non-null data.
 - **`jira_project`** — one row per project (`project_id`, `project_key`,
   `project_name`, `project_type_key`). `jira_issues.project_id` FKs into it.
 - **`jira_status_categories`** / **`jira_statuses`** — Jira's global status

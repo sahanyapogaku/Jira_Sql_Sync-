@@ -57,6 +57,51 @@ BEGIN
         FOREIGN KEY (project_id) REFERENCES dbo.jira_project(project_id);
 END
 
+-- Additive, same pattern as project_id above. due_date is a plain Jira date (no time
+-- component), matching jira_fix_versions.release_date's DATE type. environment is stored
+-- as NVARCHAR(MAX) rather than flattened further since, like "Description", Jira's
+-- schema.type "string" here doesn't rule out ADF rich text -- transform.flatten_issue
+-- flattens it through the same ADF-to-text helper used for custom field values if so.
+-- security_level is flattened to its .name only, matching how priority/status_category
+-- (also lookup-object fields) are already handled on this table -- confirmed against live
+-- data that no issue on this site currently sets environment or security (0 of 3,579), so
+-- this is schema-ready but unexercised against real non-null values for those two.
+IF COL_LENGTH('dbo.jira_issues', 'due_date') IS NULL
+BEGIN
+    ALTER TABLE dbo.jira_issues ADD due_date DATE NULL;
+END
+
+IF COL_LENGTH('dbo.jira_issues', 'environment') IS NULL
+BEGIN
+    ALTER TABLE dbo.jira_issues ADD environment NVARCHAR(MAX) NULL;
+END
+
+IF COL_LENGTH('dbo.jira_issues', 'security_level') IS NULL
+BEGIN
+    ALTER TABLE dbo.jira_issues ADD security_level NVARCHAR(255) NULL;
+END
+
+-- Additive, same pattern as above. Issue-level time-tracking rollups (Jira's own
+-- Original Estimate / Remaining Estimate / Time Spent on the issue itself) -- distinct
+-- from jira_worklogs.time_spent_seconds, which is per individual work-log entry, not the
+-- issue's aggregate. All three are plain integer seconds on the wire, same representation
+-- jira_worklogs already uses, confirmed against live data (non-zero on 4/15/12 issues
+-- respectively out of 3,579).
+IF COL_LENGTH('dbo.jira_issues', 'original_estimate_seconds') IS NULL
+BEGIN
+    ALTER TABLE dbo.jira_issues ADD original_estimate_seconds INT NULL;
+END
+
+IF COL_LENGTH('dbo.jira_issues', 'remaining_estimate_seconds') IS NULL
+BEGIN
+    ALTER TABLE dbo.jira_issues ADD remaining_estimate_seconds INT NULL;
+END
+
+IF COL_LENGTH('dbo.jira_issues', 'time_spent_seconds') IS NULL
+BEGIN
+    ALTER TABLE dbo.jira_issues ADD time_spent_seconds INT NULL;
+END
+
 -- General field-change history. Status transitions are excluded here and land in
 -- jira_issue_status_history instead -- Atlassian's recommended structure keeps the two
 -- separate, with status referencing a proper jira_statuses lookup instead of plain text.
