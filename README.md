@@ -138,15 +138,20 @@ current set, not a diff (see `db.replace_*`).
 
 Full DDL: see `schema.sql`.
 
+## Decisions
+
+- **`jira_issues.custom_fields_json` / `.components` blob columns** — kept
+  permanently, alongside `jira_custom_field_values` / `jira_issue_components`
+  (and `jira_issue_labels`, which duplicates `jira_issues.labels` the same
+  way). This matches the pattern already established for labels by original
+  design ("stays as-is... for raw-payload convenience" — see `schema.sql`).
+  Nothing inside this codebase reads the blobs back out, but an external
+  consumer (BI tool, ad-hoc query) might, and there's no cost to keeping
+  them — so removing them for normalization-purity alone isn't worth the
+  risk. Not up for revisiting without a concrete reason.
+
 ## Open questions
 
-- **`jira_issues.custom_fields_json` / `.components` blob columns** — now
-  partially duplicated by `jira_custom_field_values`, `jira_issue_components`,
-  and `jira_issue_labels`. Whether to keep these JSON blobs as a
-  denormalized safety net or drop them is still undecided; within this
-  codebase nothing reads them back out (they're write-only), but an external
-  consumer (BI tool, ad-hoc query) might. Left in place, still populated,
-  pending that decision.
 - **`jira_custom_field_values` for the "Approvals" field**
   (`customfield_10046`) — currently stored as one large JSON blob per issue
   (up to ~37KB). Extracting `approval_status` / `final_decision` /
@@ -174,6 +179,11 @@ Full DDL: see `schema.sql`.
 - `TROUBLESHOOTING.md` — catalog of failure modes actually seen in this
   pipeline (MSSQL connection drops, Jira auth/rate-limit errors, etc.), what
   handles each automatically, and what to check manually when it doesn't.
+- `API_LOGIC.md` — every Jira endpoint called, its pagination style, and the
+  full rate-limit/backoff behavior, plus the API-deprecation change
+  management plan.
+- `PROCESS.md` — the operational runbook: schedule, success criteria,
+  log/error alerting, and rollback plan.
 
 ## Error handling
 
