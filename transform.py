@@ -235,6 +235,43 @@ def extract_project_row(fields):
     }
 
 
+_DISPLAY_KEYS = ("name", "value", "displayName")
+
+
+def _extract_display_key(item):
+    """Best-effort human-readable label for one dict-shaped custom field value entry."""
+    if not isinstance(item, dict):
+        return None
+    for key in _DISPLAY_KEYS:
+        candidate = item.get(key)
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return None
+
+
+def _flatten_display_value(value):
+    """Best-effort readable text for a custom field's (already ADF-flattened) value.
+
+    Same generic-shape-detection philosophy as the ADF handling below -- no per-field-id
+    lookup table, since which fields use which shape (single option object, list of option
+    objects, list of full objects like Sprint's sprint dicts, etc.) is a per-site admin
+    choice. Returns None when nothing recognizable is found (e.g. the Approvals field's
+    blob, which doesn't have name/value/displayName at the top level) so callers can fall
+    back to the raw `value` column instead of showing a misleadingly empty display value.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return _extract_display_key(value)
+    if isinstance(value, list):
+        labels = [_extract_display_key(item) for item in value]
+        labels = [label for label in labels if label]
+        return ", ".join(labels) if labels else None
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    return None
+
+
 def extract_custom_field_value_rows(issue_id, issue_key, fields):
     """An issue's customfield_* entries -> list of jira_custom_field_values row dicts (skips nulls).
 
@@ -244,6 +281,10 @@ def extract_custom_field_value_rows(issue_id, issue_key, fields):
     comment/worklog bodies, rather than stored as raw ADF JSON. Detection is generic
     (any dict value with type == "doc"), not a hardcoded field-id list, since which fields
     use ADF is a per-site admin choice, same reasoning as the Sprint/Team field-id lookups.
+
+    `value` always keeps the full-fidelity encoding (plain text, or JSON for anything
+    structured). `value_display` is a second, best-effort readable column alongside it --
+    see _flatten_display_value -- NULL where no readable label could be derived.
     """
     rows = []
     for field_id, value in _extract_custom_fields(fields).items():
@@ -256,6 +297,7 @@ def extract_custom_field_value_rows(issue_id, issue_key, fields):
             "issue_key": issue_key,
             "field_id": field_id,
             "value": value if isinstance(value, str) else json.dumps(value, default=str),
+            "value_display": _flatten_display_value(value),
         })
     return rows
 

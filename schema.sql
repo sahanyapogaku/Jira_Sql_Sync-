@@ -249,10 +249,21 @@ BEGIN
         issue_key     NVARCHAR(20)    NOT NULL,
         field_id      NVARCHAR(50)    NOT NULL,   -- e.g. "customfield_10057"
         value         NVARCHAR(MAX)   NULL,       -- JSON-serialized value (matches custom_fields_json's encoding)
+        value_display NVARCHAR(MAX)   NULL,       -- best-effort human-readable text, NULL if not derivable -- see transform._flatten_display_value
         etl_loaded_at DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME(),
         CONSTRAINT PK_jira_custom_field_values PRIMARY KEY (issue_id, field_id)
     );
     CREATE INDEX IX_jira_custom_field_values_field ON dbo.jira_custom_field_values(field_id);
+END
+
+-- Additive, same pattern as jira_issues.due_date etc. above. `value` stays exactly as-is
+-- (full fidelity, e.g. the ~37KB Approvals blobs -- see README "Open questions"); this is a
+-- second, best-effort column alongside it rather than a replacement, since collapsing a
+-- structured value (Sprint's array of sprint objects being the motivating example) down to
+-- one string is lossy and we don't want to lose the ability to get the rest back out.
+IF COL_LENGTH('dbo.jira_custom_field_values', 'value_display') IS NULL
+BEGIN
+    ALTER TABLE dbo.jira_custom_field_values ADD value_display NVARCHAR(MAX) NULL;
 END
 
 IF OBJECT_ID('dbo.jira_fix_versions', 'U') IS NULL

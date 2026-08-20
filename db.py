@@ -196,7 +196,7 @@ PROJECT_COLUMNS = ["project_id", "project_key", "project_name", "project_type_ke
 
 FIELD_DEF_COLUMNS = ["field_id", "field_name", "field_type"]
 
-CUSTOM_FIELD_VALUE_COLUMNS = ["issue_id", "issue_key", "field_id", "value"]
+CUSTOM_FIELD_VALUE_COLUMNS = ["issue_id", "issue_key", "field_id", "value", "value_display"]
 
 FIX_VERSION_COLUMNS = ["version_id", "version_name", "project_id", "release_date", "released"]
 

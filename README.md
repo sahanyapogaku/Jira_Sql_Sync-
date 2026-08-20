@@ -107,7 +107,12 @@ current set, not a diff (see `db.replace_*`).
   every `customfield_*` key (from `/rest/api/3/field`), so `field_id` values
   elsewhere are resolvable to a human name.
 - **`jira_custom_field_values`** — one row per `(issue_id, field_id)`, current
-  value only. Replaced wholesale per issue on each sync.
+  value only. Replaced wholesale per issue on each sync. `value` is the
+  full-fidelity encoding (plain text, or JSON for anything structured);
+  `value_display` is a best-effort readable column alongside it (e.g. just
+  the sprint name(s) for the Sprint field, instead of the full array of
+  sprint objects) — NULL where no readable label could be derived, in which
+  case fall back to parsing `value` directly. See "Decisions" below.
 - **`jira_fix_versions`** / **`jira_issue_fix_versions`** — the version
   dimension and its issue junction table. The junction is replaced wholesale
   per issue on each sync.
@@ -149,14 +154,27 @@ Full DDL: see `schema.sql`.
   consumer (BI tool, ad-hoc query) might, and there's no cost to keeping
   them — so removing them for normalization-purity alone isn't worth the
   risk. Not up for revisiting without a concrete reason.
+- **`jira_custom_field_values.value_display`** — added because `value`
+  alone was landing raw-JSON blobs for any structured (non-string, non-ADF)
+  custom field, e.g. the Sprint field's array of full sprint objects
+  (id/name/state/board/goal/dates), which isn't usable directly by an
+  ad-hoc query or BI tool. `value_display` is a generic best-effort label
+  (`transform._flatten_display_value`): a plain string as-is, or for a
+  dict/list of dicts, the first of `name` / `value` / `displayName` found
+  per item (joined with `, ` for lists). No per-field-id lookup table, same
+  generic-shape-detection approach already used for ADF. `value` is kept
+  unchanged alongside it (full fidelity, nothing lossy) rather than
+  replaced, matching the raw-blob-plus-normalized precedent above.
 
 ## Open questions
 
 - **`jira_custom_field_values` for the "Approvals" field**
   (`customfield_10046`) — currently stored as one large JSON blob per issue
-  (up to ~37KB). Extracting `approval_status` / `final_decision` /
-  `approver_id` (etc.) into real columns has been proposed but not built —
-  see the custom-field-formatting investigation notes.
+  (up to ~37KB), and `value_display` will be NULL for it too, since the
+  blob has no top-level `name`/`value`/`displayName` key. Extracting
+  `approval_status` / `final_decision` / `approver_id` (etc.) into real
+  columns has been proposed but not built — see the custom-field-formatting
+  investigation notes.
 
 ## Files
 
