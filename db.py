@@ -225,6 +225,11 @@ ISSUE_SPRINT_COLUMNS = ["issue_id", "issue_key", "sprint_id"]
 
 TEAM_COLUMNS = ["issue_id", "issue_key", "team_id", "team_name"]
 
+PURCHASE_ORDER_COLUMNS = [
+    "issue_id", "issue_key", "po_number", "order_number", "total_cost", "qty",
+    "need_date", "po_needed", "mrp_planned", "category", "vendor_project",
+]
+
 STATUS_CATEGORY_COLUMNS = ["category_id", "category_key", "category_name", "color_name"]
 
 STATUS_COLUMNS = ["status_id", "status_name", "category_id"]
@@ -918,6 +923,38 @@ def replace_team(conn, issue_ids, rows):
 
     conn.commit()
     logger.info("Replaced team links for %d issues (%d teams loaded)", len(issue_ids), len(rows))
+    return len(rows)
+
+
+def replace_purchase_orders(conn, issue_ids, rows):
+    """Replace jira_issue_purchase_orders rows for the given issue_ids. Same wholesale-
+    replace rationale as replace_team: a PO number can be edited/removed from a
+    description on re-sync, and rows is only ever a subset of issue_ids (see
+    transform.extract_purchase_order_row -- no row at all when no PO number is found), so
+    stale rows for issues that no longer have one must be cleared, not just left in place.
+    """
+    if not issue_ids:
+        return 0
+    cur = conn.cursor()
+    placeholders = ", ".join("?" for _ in issue_ids)
+    cur.execute(f"DELETE FROM dbo.jira_issue_purchase_orders WHERE issue_id IN ({placeholders})", issue_ids)
+
+    if rows:
+        cur.execute("""
+            IF OBJECT_ID('tempdb..#stg_po') IS NOT NULL DROP TABLE #stg_po;
+            SELECT TOP 0 * INTO #stg_po FROM dbo.jira_issue_purchase_orders;
+            ALTER TABLE #stg_po ALTER COLUMN etl_loaded_at DATETIME2 NULL;
+        """)
+        ph = ", ".join("?" for _ in PURCHASE_ORDER_COLUMNS)
+        cur.executemany(
+            f"INSERT INTO #stg_po ({', '.join(PURCHASE_ORDER_COLUMNS)}) VALUES ({ph})",
+            _rows_to_tuples(rows, PURCHASE_ORDER_COLUMNS),
+        )
+        cols = ", ".join(PURCHASE_ORDER_COLUMNS)
+        cur.execute(f"INSERT INTO dbo.jira_issue_purchase_orders ({cols}) SELECT {cols} FROM #stg_po")
+
+    conn.commit()
+    logger.info("Replaced purchase orders for %d issues (%d POs loaded)", len(issue_ids), len(rows))
     return len(rows)
 
 

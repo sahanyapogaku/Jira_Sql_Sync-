@@ -170,7 +170,6 @@ class JiraClient:
             total = data.get("total", start_at)
             if data.get("isLast", start_at >= total) or not values:
                 break
-
     def get_comments(self, issue_key):
         """Generator yielding comment entries: {id, author, body, created, updated}."""
         start_at = 0

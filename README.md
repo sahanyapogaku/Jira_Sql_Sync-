@@ -112,7 +112,8 @@ current set, not a diff (see `db.replace_*`).
   `value_display` is a best-effort readable column alongside it (e.g. just
   the sprint name(s) for the Sprint field, instead of the full array of
   sprint objects) — NULL where no readable label could be derived, in which
-  case fall back to parsing `value` directly. See "Decisions" below.
+  case fall back to parsing `value` directly. Excludes the "Rank" field
+  entirely (resolved by name at runtime). See "Decisions" below.
 - **`jira_fix_versions`** / **`jira_issue_fix_versions`** — the version
   dimension and its issue junction table. The junction is replaced wholesale
   per issue on each sync.
@@ -140,6 +141,19 @@ current set, not a diff (see `db.replace_*`).
   populated directly from the field's own payload (confirmed to already
   include a display name on this site), so no separate call to the
   Atlassian Teams API is made.
+- **`jira_issue_purchase_orders`** — one row per issue that has a PO number,
+  detected as a `POKRM_##########` token regex-extracted from the issue
+  description (confirmed live: the dedicated "Order Number" field is only
+  populated on ~18% of issues that actually have one — the real PO number
+  is almost always typed as free text instead). No row at all for issues
+  without one, not a row with `po_number = NULL`. The other columns
+  (`total_cost`, `qty`, `need_date`, `po_needed`, `mrp_planned`,
+  `category`, `vendor_project`) are resolved by field *name*, checking
+  every `customfield_*` id sharing that name and using whichever is
+  non-null on that issue — several of these names are reused across
+  different projects with different ids, so this isn't limited to one
+  project. Replaced wholesale per issue on each sync, same as custom field
+  values.
 
 Full DDL: see `schema.sql`.
 
@@ -165,6 +179,15 @@ Full DDL: see `schema.sql`.
   generic-shape-detection approach already used for ADF. `value` is kept
   unchanged alongside it (full fidelity, nothing lossy) rather than
   replaced, matching the raw-blob-plus-normalized precedent above.
+- **`jira_custom_field_values` excludes the "Rank" field** (resolved by
+  name at runtime, same as Team/Sprint) entirely — it's Jira's internal
+  LexoRank board-ordering token, a plain string with no human-meaningful
+  content, never shown on the issue itself in Jira's own UI. Unlike every
+  other field this table covers, there's no "clean" version to derive
+  (`value_display` would just duplicate the same opaque token as `value`),
+  so it's dropped rather than kept as noise. Still present, unfiltered, in
+  `jira_issues.custom_fields_json` — the raw blob stays fully raw by design
+  (see above).
 
 ## Open questions
 

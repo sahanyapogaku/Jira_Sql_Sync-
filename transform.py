@@ -1,6 +1,9 @@
 """Transform raw Jira API payloads into row dicts matching the MSSQL table columns."""
 
 import json
+import re
+
+_PO_NUMBER_RE = re.compile(r"POKRM_\d+")
 
 
 def _adf_to_text(node):
@@ -272,7 +275,7 @@ def _flatten_display_value(value):
     return None
 
 
-def extract_custom_field_value_rows(issue_id, issue_key, fields):
+def extract_custom_field_value_rows(issue_id, issue_key, fields, exclude_custom_field_ids=None):
     """An issue's customfield_* entries -> list of jira_custom_field_values row dicts (skips nulls).
 
     Values stored as Atlassian Document Format (ADF) rich text -- confirmed present under
@@ -285,9 +288,18 @@ def extract_custom_field_value_rows(issue_id, issue_key, fields):
     `value` always keeps the full-fidelity encoding (plain text, or JSON for anything
     structured). `value_display` is a second, best-effort readable column alongside it --
     see _flatten_display_value -- NULL where no readable label could be derived.
+
+    exclude_custom_field_ids: field ids to leave out of this table entirely -- currently
+    just "Rank" (see main.py), Jira's internal LexoRank board-ordering token. It's a plain
+    string, not ADF or a structured value, so it isn't touched by either helper above and
+    would otherwise land in both `value` and `value_display` verbatim -- but it's never a
+    human-meaningful value (Jira doesn't even show it on the issue itself), so there's no
+    "clean" version to derive, unlike every other field this table covers. Only removed
+    from this table, not from jira_issues.custom_fields_json, which stays fully raw by
+    design (see README "Decisions").
     """
     rows = []
-    for field_id, value in _extract_custom_fields(fields).items():
+    for field_id, value in _extract_custom_fields(fields, exclude=exclude_custom_field_ids).items():
         if value is None:
             continue
         if isinstance(value, dict) and value.get("type") == "doc":
@@ -495,4 +507,71 @@ def extract_team_row(issue_id, issue_key, fields, team_field_id):
         "issue_key": issue_key,
         "team_id": str(team["id"]),
         "team_name": team.get("name"),
+    }
+
+
+def _option_value(raw):
+    """Jira 'option'-type custom fields return {"value": "...", ...}; plain string/number/
+    date fields return the scalar directly. Normalizes either into the display string."""
+    if isinstance(raw, dict):
+        return raw.get("value")
+    return raw
+
+
+def _find_field_value_by_name(fields, name_to_ids, name):
+    """Look up a custom field's raw value by display name, not a fixed customfield_* id.
+
+    Several field names on this site (e.g. "Category", "Project") are NOT unique -- Jira
+    has multiple different customfield_* ids sharing the same name across different
+    projects, since each project's screen can carry its own copy. name_to_ids (built once
+    per run by main.py from client.list_fields()) maps a name to every id that currently
+    has it. Rather than pin one id and silently return nothing for issues in a different
+    project, this checks every id sharing the name and returns whichever one is actually
+    non-null on *this* issue -- only one project's copy of the field is ever populated for
+    a given issue, so this resolves correctly regardless of which project the issue is in.
+    """
+    for field_id in name_to_ids.get(name, []):
+        value = fields.get(field_id)
+        if value is not None:
+            return value
+    return None
+
+
+def extract_purchase_order_row(issue_id, issue_key, fields, name_to_ids):
+    """An issue's description + PO-related custom fields -> a jira_issue_purchase_orders
+    row dict, or None if no PO number is found.
+
+    There IS a dedicated "Order Number" field for this, but confirmed against live data
+    it's populated on only 30 of 165 issues that actually have a PO -- the real PO number
+    almost always lives as free text in the description instead, typically as a bolded
+    line near the top (e.g. "PO Placed: POKRM_0100000222 -- 8/23/2026"), not in that field.
+    Detection is a generic regex for the "POKRM_<digits>" token Jira's procurement system
+    assigns, not a hardcoded per-issue lookup, since the surrounding sentence wording
+    varies (confirmed: "PO Placed: X", "original purchase order (X)", etc.) but the token
+    itself is consistent. Only the first token is captured if a description mentions more
+    than one (e.g. an amended PO referencing the original) -- confirmed as a rare case (6
+    of 165) -- since the first one found is the one nearest the top of the description,
+    matching how these are actually written.
+
+    No row is returned when no token is found, rather than a row with po_number = NULL,
+    since most issues never reach the PO stage at all.
+    """
+    description = fields.get("description")
+    description_text = _adf_to_text(description) if isinstance(description, dict) else (description or "")
+    match = _PO_NUMBER_RE.search(description_text or "")
+    if not match:
+        return None
+
+    return {
+        "issue_id": issue_id,
+        "issue_key": issue_key,
+        "po_number": match.group(0),
+        "order_number": _option_value(_find_field_value_by_name(fields, name_to_ids, "Order Number")),
+        "total_cost": _find_field_value_by_name(fields, name_to_ids, "Total Cost ($)"),
+        "qty": _find_field_value_by_name(fields, name_to_ids, "Qty"),
+        "need_date": _find_field_value_by_name(fields, name_to_ids, "Need Date"),
+        "po_needed": _option_value(_find_field_value_by_name(fields, name_to_ids, "PO Needed?")),
+        "mrp_planned": _option_value(_find_field_value_by_name(fields, name_to_ids, "MRP Planned?")),
+        "category": _option_value(_find_field_value_by_name(fields, name_to_ids, "Category")),
+        "vendor_project": _option_value(_find_field_value_by_name(fields, name_to_ids, "Project")),
     }

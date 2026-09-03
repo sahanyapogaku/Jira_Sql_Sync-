@@ -71,8 +71,9 @@ every write in this pipeline is idempotent by design:
   `jira_sprints` — upserted via `MERGE`, safe to re-run.
 - `jira_custom_field_values`, `jira_issue_labels`, `jira_issue_fix_versions`,
   `jira_issue_components`, `jira_issue_sprints`, `jira_issue_team`,
-  `jira_issue_hierarchy` — wholesale-replaced per issue on every sync, so a
-  re-run always reflects the current true state, not a stale partial one.
+  `jira_issue_hierarchy`, `jira_issue_purchase_orders` — wholesale-replaced
+  per issue on every sync, so a re-run always reflects the current true
+  state, not a stale partial one.
 
 **One real caveat** — this does *not* apply to the append-only event
 tables: `jira_issue_changelog`, `jira_issue_status_history`,

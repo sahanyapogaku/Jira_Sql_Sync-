@@ -61,7 +61,7 @@ def resolve_field_id(field_defs, field_name):
     return next((f["id"] for f in field_defs if f.get("name") == field_name), None)
 
 
-def run(jql, conn, client, known_status_ids, team_field_id, sprint_field_id):
+def run(jql, conn, client, known_status_ids, team_field_id, sprint_field_id, rank_field_id, name_to_ids):
     issue_batch = []
     project_batch = {}
     changelog_batch = []
@@ -82,8 +82,13 @@ def run(jql, conn, client, known_status_ids, team_field_id, sprint_field_id):
     sprint_batch = {}
     issue_sprint_batch = []
     team_batch = []
+    po_batch = []
     batch_issue_ids = []
     exclude_custom_field_ids = {team_field_id} if team_field_id else None
+    # Rank is excluded from jira_custom_field_values specifically (not from
+    # custom_fields_json, which stays fully raw by design) -- see
+    # transform.extract_custom_field_value_rows for why.
+    exclude_from_values = {rank_field_id} if rank_field_id else None
 
     total_issues = 0
     total_changelog = 0
@@ -99,7 +104,7 @@ def run(jql, conn, client, known_status_ids, team_field_id, sprint_field_id):
         nonlocal worklog_batch, comment_batch, issuelink_batch, remotelink_batch
         nonlocal customfieldvalue_batch, fixversion_batch, issue_fixversion_batch, attachment_batch, hierarchy_batch
         nonlocal label_batch, batch_issue_ids
-        nonlocal component_batch, issue_component_batch, sprint_batch, issue_sprint_batch, team_batch
+        nonlocal component_batch, issue_component_batch, sprint_batch, issue_sprint_batch, team_batch, po_batch
         nonlocal total_changelog, total_status_history, total_worklogs, total_comments, total_issuelinks
         nonlocal total_remotelinks, total_attachments
         if project_batch:
@@ -156,6 +161,7 @@ def run(jql, conn, client, known_status_ids, team_field_id, sprint_field_id):
             db.replace_issue_components(conn, batch_issue_ids, issue_component_batch)
             db.replace_issue_sprints(conn, batch_issue_ids, issue_sprint_batch)
             db.replace_team(conn, batch_issue_ids, team_batch)
+            db.replace_purchase_orders(conn, batch_issue_ids, po_batch)
             customfieldvalue_batch = []
             issue_fixversion_batch = []
             hierarchy_batch = []
@@ -163,6 +169,7 @@ def run(jql, conn, client, known_status_ids, team_field_id, sprint_field_id):
             issue_component_batch = []
             issue_sprint_batch = []
             team_batch = []
+            po_batch = []
             batch_issue_ids = []
 
     for issue in client.search_issues(jql, fields="*all"):
@@ -178,7 +185,9 @@ def run(jql, conn, client, known_status_ids, team_field_id, sprint_field_id):
             project_batch[project_row["project_id"]] = project_row
 
         issuelink_batch.extend(transform.extract_issuelink_rows(issue_id, issue_key, fields))
-        customfieldvalue_batch.extend(transform.extract_custom_field_value_rows(issue_id, issue_key, fields))
+        customfieldvalue_batch.extend(
+            transform.extract_custom_field_value_rows(issue_id, issue_key, fields, exclude_from_values)
+        )
         attachment_batch.extend(transform.extract_attachment_rows(issue_id, issue_key, fields))
         issue_fixversion_batch.extend(transform.extract_issue_fix_version_links(issue_id, issue_key, fields))
         label_batch.extend(transform.extract_label_rows(issue_id, issue_key, fields))
@@ -199,6 +208,10 @@ def run(jql, conn, client, known_status_ids, team_field_id, sprint_field_id):
         team_row = transform.extract_team_row(issue_id, issue_key, fields, team_field_id)
         if team_row:
             team_batch.append(team_row)
+
+        po_row = transform.extract_purchase_order_row(issue_id, issue_key, fields, name_to_ids)
+        if po_row:
+            po_batch.append(po_row)
 
         total_issues += 1
 
@@ -271,6 +284,10 @@ def main():
         logger.critical("Missing required environment variables: %s", ", ".join(missing))
         sys.exit(1)
 
+    if not os.environ["JIRA_URL"].startswith("https://"):
+        logger.critical("JIRA_URL must use https:// — refusing to send credentials over an unencrypted connection.")
+        sys.exit(1)
+
     full = args.full
     jql = build_jql(full=full, days=args.days)
     logger.info("Mode: %s | JQL: %s", "FULL" if full else f"INCREMENTAL ({args.days}d)", jql)
@@ -310,10 +327,25 @@ def main():
             # to this Jira site and would break if the pipeline is ever pointed at another.
             team_field_id = resolve_field_id(field_defs, "Team")
             sprint_field_id = resolve_field_id(field_defs, "Sprint")
+            rank_field_id = resolve_field_id(field_defs, "Rank")
             if not team_field_id:
                 logger.warning("No custom field named 'Team' found on this site — Team capture disabled for this run")
             if not sprint_field_id:
                 logger.warning("No custom field named 'Sprint' found on this site — Sprint capture disabled for this run")
+            if not rank_field_id:
+                logger.warning(
+                    "No custom field named 'Rank' found on this site — jira_custom_field_values will not "
+                    "exclude it for this run"
+                )
+
+            # Several field names (e.g. "Category", "Project") are NOT unique on this
+            # site -- multiple customfield_* ids share the same name across different
+            # projects. name_to_ids lets transform.extract_purchase_order_row check every
+            # id sharing a name and use whichever one is actually populated on a given
+            # issue, instead of resolve_field_id's single-id assumption above.
+            name_to_ids = {}
+            for f in field_defs:
+                name_to_ids.setdefault(f["name"], []).append(f["id"])
 
             statuses = client.list_statuses()
             known_status_ids = {s["status_id"] for s in statuses}
@@ -332,7 +364,9 @@ def main():
                 for s in statuses
             ])
 
-            total_issues = run(jql, conn, client, known_status_ids, team_field_id, sprint_field_id)
+            total_issues = run(
+                jql, conn, client, known_status_ids, team_field_id, sprint_field_id, rank_field_id, name_to_ids
+            )
             db.finish_pipeline_log(log_conn, log_id, status="Success", rows_processed=total_issues)
             return
 
