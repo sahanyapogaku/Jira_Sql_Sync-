@@ -25,18 +25,35 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Verify GitHub Secrets
+        env:
+          JIRA_URL: ${{ secrets.JIRA_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          MSSQL_SERVER: ${{ secrets.MSSQL_SERVER }}
+          MSSQL_DATABASE: ${{ secrets.MSSQL_DATABASE }}
+          MSSQL_USER: ${{ secrets.MSSQL_USER }}
+          MSSQL_PASSWORD: ${{ secrets.MSSQL_PASSWORD }}
+        run: |
+          test -n "$JIRA_URL" || (echo "❌ JIRA_URL is missing" && exit 1)
+          test -n "$JIRA_EMAIL" || (echo "❌ JIRA_EMAIL is missing" && exit 1)
+          test -n "$JIRA_API_TOKEN" || (echo "❌ JIRA_API_TOKEN is missing" && exit 1)
+          test -n "$MSSQL_SERVER" || (echo "❌ MSSQL_SERVER is missing" && exit 1)
+          test -n "$MSSQL_DATABASE" || (echo "❌ MSSQL_DATABASE is missing" && exit 1)
+          test -n "$MSSQL_USER" || (echo "❌ MSSQL_USER is missing" && exit 1)
+          test -n "$MSSQL_PASSWORD" || (echo "❌ MSSQL_PASSWORD is missing" && exit 1)
+
+          echo "✅ All required GitHub secrets are available."
+
       - name: Run Jira SQL Sync
         env:
           JIRA_URL: ${{ secrets.JIRA_URL }}
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-
           MSSQL_SERVER: ${{ secrets.MSSQL_SERVER }}
           MSSQL_DATABASE: ${{ secrets.MSSQL_DATABASE }}
           MSSQL_USER: ${{ secrets.MSSQL_USER }}
           MSSQL_PASSWORD: ${{ secrets.MSSQL_PASSWORD }}
-
           MSSQL_TRUST_SERVER_CERTIFICATE: "no"
-
         run: |
           python main.py
