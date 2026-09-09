@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Test SQL Server connectivity
+      - name: Test SQL Server port
         run: |
-          echo "Testing 10.10.4.174:1433..."
+          echo "Testing connectivity to SQL Server..."
           nc -vz -w 10 10.10.4.174 1433
