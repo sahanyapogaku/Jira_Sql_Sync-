@@ -1,0 +1,14 @@
+name: Test SQL Network Connectivity
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Test SQL Server connectivity
+        run: |
+          echo "Testing 10.10.4.174:1433..."
+          nc -vz -w 10 10.10.4.174 1433
