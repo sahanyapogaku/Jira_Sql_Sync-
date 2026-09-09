@@ -10,5 +10,5 @@ jobs:
     steps:
       - name: Test SQL Server port
         run: |
-          echo "Testing connectivity to SQL Server..."
+          echo "Testing connectivity to 10.10.4.174:1433"
           nc -vz -w 10 10.10.4.174 1433
