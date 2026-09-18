@@ -9,8 +9,8 @@ formalizing an already-proven pattern, not proposing an untested one.
 ## Schedule
 
 - **Incremental sync** (`python main.py --incremental`, default `--days 1`):
-  intended to run on a recurring schedule — hourly via cron or Windows Task
-  Scheduler. The 1-day default window (rather than exactly matching the
+  intended to run on a recurring schedule — hourly via SQL Server Agent.
+  The 1-day default window (rather than exactly matching the
   run interval) is a deliberate overlap: if one scheduled run is missed or
   delayed, the next one's wider window still catches whatever it missed.
 - **Full sync** (`python main.py --full`): a periodic reconciliation/backfill

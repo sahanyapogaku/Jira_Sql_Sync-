@@ -337,6 +337,10 @@ def main():
                     "No custom field named 'Rank' found on this site — jira_custom_field_values will not "
                     "exclude it for this run"
                 )
+            if team_field_id:
+                logger.info("Resolved Team field to %s (customfield_* id is site-specific, not hardcoded)", team_field_id)
+            if sprint_field_id:
+                logger.info("Resolved Sprint field to %s (customfield_* id is site-specific, not hardcoded)", sprint_field_id)
 
             # Several field names (e.g. "Category", "Project") are NOT unique on this
             # site -- multiple customfield_* ids share the same name across different
